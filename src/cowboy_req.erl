@@ -88,7 +88,7 @@
 -export_type([cookie_opts/0]).
 
 -type read_body_opts() :: #{
-	length => non_neg_integer(),
+	length => non_neg_integer() | infinity,
 	period => non_neg_integer(),
 	timeout => timeout()
 }.
@@ -98,7 +98,7 @@
 %% Cowboy expects the real length as it is used as metadata.
 %% @todo We should probably explicitly reject it.
 -type resp_body() :: iodata()
-	| {sendfile, non_neg_integer(), pos_integer(), file:name_all()}.
+	| {sendfile, non_neg_integer(), non_neg_integer(), file:name_all()}.
 -export_type([resp_body/0]).
 
 -type push_opts() :: #{
@@ -356,9 +356,6 @@ parse_header(Name = <<"content-length">>, Req) ->
 	parse_header(Name, Req, 0, fun cow_http_hd:parse_content_length/1);
 parse_header(Name = <<"cookie">>, Req) ->
 	parse_header(Name, Req, [], fun cow_cookie:parse_cookie/1);
-%% @todo That header is abstracted out and should never reach cowboy_req.
-parse_header(Name = <<"transfer-encoding">>, Req) ->
-	parse_header(Name, Req, [<<"identity">>], fun cow_http_hd:parse_transfer_encoding/1);
 parse_header(Name, Req) ->
 	parse_header(Name, Req, undefined).
 
@@ -383,7 +380,6 @@ parse_header_fun(<<"if-unmodified-since">>) -> fun cow_http_hd:parse_if_unmodifi
 parse_header_fun(<<"range">>) -> fun cow_http_hd:parse_range/1;
 parse_header_fun(<<"sec-websocket-extensions">>) -> fun cow_http_hd:parse_sec_websocket_extensions/1;
 parse_header_fun(<<"sec-websocket-protocol">>) -> fun cow_http_hd:parse_sec_websocket_protocol_req/1;
-parse_header_fun(<<"transfer-encoding">>) -> fun cow_http_hd:parse_transfer_encoding/1;
 parse_header_fun(<<"upgrade">>) -> fun cow_http_hd:parse_upgrade/1;
 parse_header_fun(<<"x-forwarded-for">>) -> fun cow_http_hd:parse_x_forwarded_for/1.
 
@@ -463,7 +459,7 @@ read_part(Req) ->
 	read_part(Req, #{length => 64000, period => 5000}).
 
 -spec read_part(Req, read_body_opts())
-	-> {ok, cow_multipart:headers(), Req} | {done, Req}
+	-> {ok, #{binary() => binary()}, Req} | {done, Req}
 	when Req::req().
 read_part(Req, Opts) ->
 	case maps:is_key(multipart, Req) of
@@ -482,9 +478,10 @@ read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
 		{more, Buffer2} ->
 			{Data, Req2} = stream_multipart(Req, Opts),
 			read_part(<< Buffer2/binary, Data/binary >>, Opts, Req2);
-		{ok, Headers, Rest} ->
-			%% @todo We may want headers as a map. Need to check the
-			%% rules for multipart header parsing before taking a decision.
+		{ok, Headers0, Rest} ->
+			Headers = maps:from_list(Headers0),
+			%% Reject multipart content containing duplicate headers.
+			true = map_size(Headers) =:= length(Headers0),
 			{ok, Headers, Req#{multipart => {Boundary, Rest}}};
 		%% Ignore epilogue.
 		{done, _} ->
@@ -634,6 +631,11 @@ reply(Status, Headers, Req) ->
 	-> Req when Req::req().
 reply(_, _, _, #{has_sent_resp := _}) ->
 	error(function_clause);
+reply(Status, Headers, {sendfile, _, 0, _}, Req)
+		when is_integer(Status); is_binary(Status) ->
+	do_reply(Status, Headers#{
+		<<"content-length">> => <<"0">>
+	}, <<>>, Req);
 reply(Status, Headers, SendFile = {sendfile, _, Len, _}, Req)
 		when is_integer(Status); is_binary(Status) ->
 	do_reply(Status, Headers#{
@@ -761,28 +763,46 @@ kvlist_to_map(Keys, [{Key, Value}|Tail], Map) ->
 		kvlist_to_map(Keys, Tail, Map)
 	end.
 
-%% Loop through fields, if value is missing and no default, crash;
-%% else if value is missing and has a default, set default;
-%% otherwise apply constraints. If constraint fails, crash.
-filter([], Map) ->
-	Map;
-filter([{Key, Constraints}|Tail], Map) ->
-	filter_constraints(Tail, Map, Key, maps:get(Key, Map), Constraints);
-filter([{Key, Constraints, Default}|Tail], Map) ->
+filter(Fields, Map0) ->
+	case filter(Fields, Map0, #{}) of
+		{ok, Map} ->
+			Map;
+		{error, Errors} ->
+			exit({validation_failed, Errors})
+	end.
+
+%% Loop through fields, if value is missing and no default,
+%% record the error; else if value is missing and has a
+%% default, set default; otherwise apply constraints. If
+%% constraint fails, record the error.
+%%
+%% When there is an error at the end, crash.
+filter([], Map, Errors) ->
+	case maps:size(Errors) of
+		0 -> {ok, Map};
+		_ -> {error, Errors}
+	end;
+filter([{Key, Constraints}|Tail], Map, Errors) ->
+	filter_constraints(Tail, Map, Errors, Key, maps:get(Key, Map), Constraints);
+filter([{Key, Constraints, Default}|Tail], Map, Errors) ->
 	case maps:find(Key, Map) of
 		{ok, Value} ->
-			filter_constraints(Tail, Map, Key, Value, Constraints);
+			filter_constraints(Tail, Map, Errors, Key, Value, Constraints);
 		error ->
-			filter(Tail, Map#{Key => Default})
+			filter(Tail, Map#{Key => Default}, Errors)
 	end;
-filter([Key|Tail], Map) ->
-	true = maps:is_key(Key, Map),
-	filter(Tail, Map).
-
-filter_constraints(Tail, Map, Key, Value, Constraints) ->
-	case cowboy_constraints:validate(Value, Constraints) of
+filter([Key|Tail], Map, Errors) ->
+	case maps:is_key(Key, Map) of
 		true ->
-			filter(Tail, Map);
-		{true, Value2} ->
-			filter(Tail, Map#{Key => Value2})
+			filter(Tail, Map, Errors);
+		false ->
+			filter(Tail, Map, Errors#{Key => required})
+	end.
+
+filter_constraints(Tail, Map, Errors, Key, Value0, Constraints) ->
+	case cowboy_constraints:validate(Value0, Constraints) of
+		{ok, Value} ->
+			filter(Tail, Map#{Key => Value}, Errors);
+		{error, Reason} ->
+			filter(Tail, Map, Errors#{Key => Reason})
 	end.

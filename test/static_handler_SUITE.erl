@@ -209,6 +209,11 @@ bad_dir_route(Config) ->
 	{500, _, _} = do_get("/bad/dir/route", Config),
 	ok.
 
+bad_file_in_priv_dir_in_ez_archive(Config) ->
+	doc("Get a missing file from a priv_dir stored in Erlang application .ez archive."),
+	{404, _, _} = do_get("/ez_priv_dir/index.php", Config),
+	ok.
+
 bad_file_path(Config) ->
 	doc("Bad cowboy_static options: wrong path."),
 	{404, _, _} = do_get("/bad/file/path", Config),
@@ -234,6 +239,11 @@ bad_priv_dir_app(Config) ->
 	{500, _, _} = do_get("/bad/priv_dir/app/style.css", Config),
 	ok.
 
+bad_priv_dir_in_ez_archive(Config) ->
+	doc("Bad cowboy_static options: priv_dir path missing from Erlang application .ez archive."),
+	{404, _, _} = do_get("/bad/ez_priv_dir/index.html", Config),
+	ok.
+
 bad_priv_dir_no_priv(Config) ->
 	doc("Bad cowboy_static options: application has no priv directory."),
 	{404, _, _} = do_get("/bad/priv_dir/no-priv/style.css", Config),
@@ -252,6 +262,11 @@ bad_priv_dir_route(Config) ->
 bad_priv_file_app(Config) ->
 	doc("Bad cowboy_static options: wrong application name."),
 	{500, _, _} = do_get("/bad/priv_file/app", Config),
+	ok.
+
+bad_priv_file_in_ez_archive(Config) ->
+	doc("Bad cowboy_static options: priv_file path missing from Erlang application .ez archive."),
+	{404, _, _} = do_get("/bad/ez_priv_file/index.php", Config),
 	ok.
 
 bad_priv_file_no_priv(Config) ->
@@ -320,6 +335,11 @@ dir_dotdot_file(Config) ->
 	%% Try to fool the server to accept segments corresponding to real folders.
 	{404, _, _} = do_get(config(prefix, Config) ++ "/../static/style.css", Config),
 	{404, _, _} = do_get(config(prefix, Config) ++ "/directory/../../static/style.css", Config),
+	ok.
+
+dir_empty_file(Config) ->
+	doc("Get an empty .txt file."),
+	{200, Headers, <<>>} = do_get(config(prefix, Config) ++ "/empty.txt", Config),
 	ok.
 
 dir_error_directory(Config) ->
@@ -731,10 +751,22 @@ mime_hardcode_tuple(Config) ->
 	{_, <<"application/vnd.ninenines.cowboy+xml;v=1">>} = lists:keyfind(<<"content-type">>, 1, Headers),
 	ok.
 
+priv_dir_in_ez_archive(Config) ->
+	doc("Get a file from a priv_dir stored in Erlang application .ez archive."),
+	{200, Headers, <<"<h1>It works!</h1>\n">>} = do_get("/ez_priv_dir/index.html", Config),
+	{_, <<"text/html">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	ok.
+
 priv_file(Config) ->
 	doc("Get a file with hardcoded route."),
 	{200, Headers, <<"body{color:red}\n">>} = do_get("/priv_file/style.css", Config),
 	{_, <<"text/css">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	ok.
+
+priv_file_in_ez_archive(Config) ->
+	doc("Get a file stored in Erlang application .ez archive."),
+	{200, Headers, <<"<h1>It works!</h1>\n">>} = do_get("/ez_priv_file/index.html", Config),
+	{_, <<"text/html">>} = lists:keyfind(<<"content-type">>, 1, Headers),
 	ok.
 
 unicode_basic_latin(Config) ->
@@ -787,31 +819,4 @@ unknown_option(Config) ->
 	doc("Get a file configured with unknown extra options."),
 	{200, Headers, <<"body{color:red}\n">>} = do_get("/unknown/option", Config),
 	{_, <<"text/css">>} = lists:keyfind(<<"content-type">>, 1, Headers),
-	ok.
-
-priv_file_in_ez_archive(Config) ->
-	doc("Get a file stored in Erlang application .ez archive."),
-	{200, Headers, <<"<h1>It works!</h1>\n">>} = do_get("/ez_priv_file/index.html", Config),
-	{_, <<"text/html">>} = lists:keyfind(<<"content-type">>, 1, Headers),
-	ok.
-
-bad_priv_file_in_ez_archive(Config) ->
-	doc("Bad cowboy_static options: priv_file path missing from Erlang application .ez archive."),
-	{404, _, _} = do_get("/bad/ez_priv_file/index.php", Config),
-	ok.
-
-priv_dir_in_ez_archive(Config) ->
-	doc("Get a file from a priv_dir stored in Erlang application .ez archive."),
-	{200, Headers, <<"<h1>It works!</h1>\n">>} = do_get("/ez_priv_dir/index.html", Config),
-	{_, <<"text/html">>} = lists:keyfind(<<"content-type">>, 1, Headers),
-	ok.
-
-bad_file_in_priv_dir_in_ez_archive(Config) ->
-	doc("Get a missing file from a priv_dir stored in Erlang application .ez archive."),
-	{404, _, _} = do_get("/ez_priv_dir/index.php", Config),
-	ok.
-
-bad_priv_dir_in_ez_archive(Config) ->
-	doc("Bad cowboy_static options: priv_dir path missing from Erlang application .ez archive."),
-	{404, _, _} = do_get("/bad/ez_priv_dir/index.html", Config),
 	ok.
