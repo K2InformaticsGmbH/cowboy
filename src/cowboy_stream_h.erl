@@ -21,7 +21,7 @@
 -export([terminate/3]).
 -export([early_error/5]).
 
--export([proc_lib_hack/3]).
+-export([request_process/3]).
 -export([execute/3]).
 -export([resume/5]).
 
@@ -47,7 +47,7 @@ init(_StreamID, Req=#{ref := Ref}, Opts) ->
 	Env = maps:get(env, Opts, #{}),
 	Middlewares = maps:get(middlewares, Opts, [cowboy_router, cowboy_handler]),
 	Shutdown = maps:get(shutdown_timeout, Opts, 5000),
-	Pid = proc_lib:spawn_link(?MODULE, proc_lib_hack, [Req, Env, Middlewares]),
+	Pid = proc_lib:spawn_link(?MODULE, request_process, [Req, Env, Middlewares]),
 	{[{spawn, Pid, Shutdown}], #state{ref=Ref, pid=Pid}}.
 
 %% If we receive data and stream is waiting for data:
@@ -69,14 +69,17 @@ data(_StreamID, IsFin, Data, State=#state{pid=Pid, read_body_ref=Ref,
 -spec info(cowboy_stream:streamid(), any(), State)
 	-> {cowboy_stream:commands(), State} when State::#state{}.
 info(_StreamID, {'EXIT', Pid, normal}, State=#state{pid=Pid}) ->
-	%% @todo Do we even reach this clause?
 	{[stop], State};
-info(_StreamID, {'EXIT', Pid, {_Reason, [T1, T2|_]}}, State=#state{pid=Pid})
-		when element(1, T1) =:= cow_http_hd; element(1, T2) =:= cow_http_hd ->
-	%% @todo Have an option to enable/disable this specific crash report?
+info(_StreamID, {'EXIT', Pid, {{request_error, Reason, _HumanReadable}, _}}, State=#state{pid=Pid}) ->
+	%% @todo Optionally report the crash to help debugging.
 	%%report_crash(Ref, StreamID, Pid, Reason, Stacktrace),
+	Status = case Reason of
+		timeout -> 408;
+		payload_too_large -> 413;
+		_ -> 400
+	end,
 	%% @todo Headers? Details in body? More stuff in debug only?
-	{[{error_response, 400, #{<<"content-length">> => <<"0">>}, <<>>}, stop], State};
+	{[{error_response, Status, #{<<"content-length">> => <<"0">>}, <<>>}, stop], State};
 info(StreamID, Exit = {'EXIT', Pid, {Reason, Stacktrace}}, State=#state{ref=Ref, pid=Pid}) ->
 	report_crash(Ref, StreamID, Pid, Reason, Stacktrace),
 	{[
@@ -117,7 +120,6 @@ info(_StreamID, SwitchProtocol = {switch_protocol, _, _, _}, State) ->
 	{[SwitchProtocol], State};
 %% Stray message.
 info(_StreamID, _Info, State) ->
-	%% @todo Cleanup if no reply was sent when stream ends.
 	{[], State}.
 
 -spec terminate(cowboy_stream:streamid(), cowboy_stream:reason(), #state{}) -> ok.
@@ -147,26 +149,32 @@ report_crash(Ref, StreamID, Pid, Reason, Stacktrace) ->
 
 %% Request process.
 
-%% @todo This should wrap with try/catch to get the full error
-%% in the stream handler. Only then can we decide what to do
-%% about it. This means that we should remove any other try/catch
-%% in the request process.
-
-%% This hack is necessary because proc_lib does not propagate
-%% stacktraces by default. This is ugly because we end up
-%% having two try/catch instead of one (the one in proc_lib),
-%% just to add the stacktrace information.
+%% We catch all exceptions in order to add the stacktrace to
+%% the exit reason as it is not propagated by proc_lib otherwise
+%% and therefore not present in the 'EXIT' message. We want
+%% the stacktrace in order to simplify debugging of errors.
 %%
-%% @todo Remove whenever proc_lib propagates stacktraces.
--spec proc_lib_hack(_, _, _) -> _.
-proc_lib_hack(Req, Env, Middlewares) ->
+%% This + the behavior in proc_lib means that we will get a
+%% {Reason, Stacktrace} tuple for every exceptions, instead of
+%% just for errors and throws.
+%%
+%% @todo Better spec.
+-spec request_process(_, _, _) -> _.
+request_process(Req, Env, Middlewares) ->
+	OTP = erlang:system_info(otp_release),
 	try
 		execute(Req, Env, Middlewares)
 	catch
-		_:Reason when element(1, Reason) =:= cowboy_handler ->
-			exit(Reason);
-		_:Reason ->
-			exit({Reason, erlang:get_stacktrace()})
+		exit:Reason ->
+			Stacktrace = erlang:get_stacktrace(),
+			erlang:raise(exit, {Reason, Stacktrace}, Stacktrace);
+		%% OTP 19 does not propagate any exception stacktraces,
+		%% we therefore add it for every class of exception.
+		_:Reason when OTP =:= "19" ->
+			Stacktrace = erlang:get_stacktrace(),
+			erlang:raise(exit, {Reason, Stacktrace}, Stacktrace);
+		Class:Reason ->
+			erlang:raise(Class, Reason, erlang:get_stacktrace())
 	end.
 
 %% @todo
