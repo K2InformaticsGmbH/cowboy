@@ -194,7 +194,13 @@ parse_qs(#{qs := Qs}) ->
 
 -spec match_qs(cowboy:fields(), req()) -> map().
 match_qs(Fields, Req) ->
-	filter(Fields, kvlist_to_map(Fields, parse_qs(Req))).
+	case filter(Fields, kvlist_to_map(Fields, parse_qs(Req))) of
+		{ok, Map} ->
+			Map;
+		{error, Errors} ->
+			exit({request_error, {match_qs, Errors},
+				'Query string validation constraints failed for the reasons provided.'})
+	end.
 
 -spec uri(req()) -> iodata().
 uri(Req) ->
@@ -407,7 +413,13 @@ parse_cookies(Req) ->
 
 -spec match_cookies(cowboy:fields(), req()) -> map().
 match_cookies(Fields, Req) ->
-	filter(Fields, kvlist_to_map(Fields, parse_cookies(Req))).
+	case filter(Fields, kvlist_to_map(Fields, parse_cookies(Req))) of
+		{ok, Map} ->
+			Map;
+		{error, Errors} ->
+			exit({request_error, {match_cookies, Errors},
+				'Cookie validation constraints failed for the reasons provided.'})
+	end.
 
 %% Request body.
 
@@ -440,7 +452,7 @@ read_body(Req=#{pid := Pid, streamid := StreamID}, Opts) ->
 	receive
 		{request_body, Ref, nofin, Body} ->
 			{more, Body, Req};
-		{request_body, Ref, {fin, BodyLength}, Body} ->
+		{request_body, Ref, fin, BodyLength, Body} ->
 			{ok, Body, set_body_length(Req, BodyLength)}
 	after Timeout ->
 		exit(timeout)
@@ -494,7 +506,7 @@ read_part(Req) ->
 read_part(Req, Opts) ->
 	case maps:is_key(multipart, Req) of
 		true ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(Data, Opts, Req2);
 		false ->
 			read_part(init_multipart(Req), Opts)
@@ -503,10 +515,10 @@ read_part(Req, Opts) ->
 read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
 	try cow_multipart:parse_headers(Buffer, Boundary) of
 		more ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(<< Buffer/binary, Data/binary >>, Opts, Req2);
 		{more, Buffer2} ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(<< Buffer2/binary, Data/binary >>, Opts, Req2);
 		{ok, Headers0, Rest} ->
 			Headers = maps:from_list(Headers0),
@@ -545,7 +557,7 @@ read_part_body(Buffer, Opts, Req=#{multipart := {Boundary, _}}, Acc) ->
 		true ->
 			{more, Acc, Req#{multipart => {Boundary, Buffer}}};
 		false ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, body),
 			case cow_multipart:parse_body(<< Buffer/binary, Data/binary >>, Boundary) of
 				{ok, Body} ->
 					read_part_body(<<>>, Opts, Req2, << Acc/binary, Body/binary >>);
@@ -571,12 +583,20 @@ init_multipart(Req) ->
 				'Missing boundary parameter for multipart media type.'})
 	end.
 
-stream_multipart(Req=#{multipart := done}, _) ->
+stream_multipart(Req=#{multipart := done}, _, _) ->
 	{<<>>, Req};
-stream_multipart(Req=#{multipart := {_, <<>>}}, Opts) ->
-	{_, Data, Req2} = read_body(Req, Opts),
-	{Data, Req2};
-stream_multipart(Req=#{multipart := {Boundary, Buffer}}, _) ->
+stream_multipart(Req=#{multipart := {_, <<>>}}, Opts, Type) ->
+	case read_body(Req, Opts) of
+		{more, Data, Req2} ->
+			{Data, Req2};
+		%% We crash when the data ends unexpectedly.
+		{ok, <<>>, _} ->
+			exit({request_error, {multipart, Type},
+				'Malformed body; multipart expected.'});
+		{ok, Data, Req2} ->
+			{Data, Req2}
+	end;
+stream_multipart(Req=#{multipart := {Boundary, Buffer}}, _, _) ->
 	{Buffer, Req#{multipart => {Boundary, <<>>}}}.
 
 %% Response.
@@ -803,12 +823,7 @@ kvlist_to_map(Keys, [{Key, Value}|Tail], Map) ->
 	end.
 
 filter(Fields, Map0) ->
-	case filter(Fields, Map0, #{}) of
-		{ok, Map} ->
-			Map;
-		{error, Errors} ->
-			exit({validation_failed, Errors})
-	end.
+	filter(Fields, Map0, #{}).
 
 %% Loop through fields, if value is missing and no default,
 %% record the error; else if value is missing and has a

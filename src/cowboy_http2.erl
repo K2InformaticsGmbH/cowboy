@@ -49,9 +49,7 @@
 	%% Whether we finished receiving data.
 	remote = nofin :: cowboy_stream:fin(),
 	%% Remote flow control window (how much we accept to receive).
-	remote_window :: integer(),
-	%% Request body length.
-	body_length = 0 :: non_neg_integer()
+	remote_window :: integer()
 }).
 
 -type stream() :: #stream{}.
@@ -289,28 +287,25 @@ frame(State=#state{client_streamid=LastStreamID}, {data, StreamID, _, _})
 	terminate(State, {connection_error, protocol_error,
 		'DATA frame received on a stream in idle state. (RFC7540 5.1)'});
 frame(State0=#state{remote_window=ConnWindow, streams=Streams},
-		{data, StreamID, IsFin0, Data}) ->
+		{data, StreamID, IsFin, Data}) ->
 	DataLen = byte_size(Data),
 	State = State0#state{remote_window=ConnWindow - DataLen},
 	case lists:keyfind(StreamID, #stream.id, Streams) of
-		Stream = #stream{state=StreamState0, remote=nofin,
-				remote_window=StreamWindow, body_length=Len0} ->
-			Len = Len0 + DataLen,
-			IsFin = case IsFin0 of
-				fin -> {fin, Len};
-				nofin -> nofin
-			end,
+		Stream = #stream{state=flush, remote=nofin, remote_window=StreamWindow} ->
+			%% @todo We need to cancel streams that we don't want to receive
+			%% the full body from after we finish flushing the response.
+			after_commands(State, Stream#stream{remote=IsFin, remote_window=StreamWindow - DataLen});
+		Stream = #stream{state=StreamState0, remote=nofin, remote_window=StreamWindow} ->
 			try cowboy_stream:data(StreamID, IsFin, Data, StreamState0) of
 				{Commands, StreamState} ->
-					commands(State,
-						Stream#stream{state=StreamState, remote_window=StreamWindow - DataLen,
-						body_length=Len}, Commands)
-			catch Class:Reason ->
-				error_logger:error_msg("Exception occurred in "
-					"cowboy_stream:data(~p, ~p, ~p, ~p) with reason ~p:~p.",
-					[StreamID, IsFin0, Data, StreamState0, Class, Reason]),
-				stream_reset(State, StreamID, {internal_error, {Class, Reason},
-					'Exception occurred in cowboy_stream:data/4.'})
+					commands(State, Stream#stream{state=StreamState, remote=IsFin,
+						remote_window=StreamWindow - DataLen}, Commands)
+			catch Class:Exception ->
+				cowboy_stream:report_error(data,
+					[StreamID, IsFin, Data, StreamState0],
+					Class, Exception, erlang:get_stacktrace()),
+				stream_reset(State, StreamID, {internal_error, {Class, Exception},
+					'Unhandled exception in cowboy_stream:data/4.'})
 			end;
 		#stream{remote=fin} ->
 			stream_reset(State, StreamID, {stream_error, stream_closed,
@@ -437,16 +432,19 @@ down(State=#state{children=Children0}, Pid, Msg) ->
 
 info(State=#state{streams=Streams}, StreamID, Msg) ->
 	case lists:keyfind(StreamID, #stream.id, Streams) of
+		#stream{state=flush} ->
+			error_logger:error_msg("Received message ~p for terminated stream ~p.", [Msg, StreamID]),
+			State;
 		Stream = #stream{state=StreamState0} ->
 			try cowboy_stream:info(StreamID, Msg, StreamState0) of
 				{Commands, StreamState} ->
 					commands(State, Stream#stream{state=StreamState}, Commands)
-			catch Class:Reason ->
-				error_logger:error_msg("Exception occurred in "
-					"cowboy_stream:info(~p, ~p, ~p) with reason ~p:~p.",
-					[StreamID, Msg, StreamState0, Class, Reason]),
-				stream_reset(State, StreamID, {internal_error, {Class, Reason},
-					'Exception occurred in cowboy_stream:info/3.'})
+			catch Class:Exception ->
+				cowboy_stream:report_error(info,
+					[StreamID, Msg, StreamState0],
+					Class, Exception, erlang:get_stacktrace()),
+				stream_reset(State, StreamID, {internal_error, {Class, Exception},
+					'Unhandled exception in cowboy_stream:info/3.'})
 			end;
 		false ->
 			error_logger:error_msg("Received message ~p for unknown stream ~p.", [Msg, StreamID]),
@@ -483,7 +481,7 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 			commands(State1#state{encode_state=EncodeState}, Stream1, Tail)
 	end;
 %% @todo response when local!=idle
-%% Send response headers and initiate chunked encoding.
+%% Send response headers.
 commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
 		Stream=#stream{id=StreamID, local=idle}, [{headers, StatusCode, Headers0}|Tail]) ->
 	Headers = Headers0#{<<":status">> => status(StatusCode)},
@@ -492,16 +490,6 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 	commands(State#state{encode_state=EncodeState}, Stream#stream{local=nofin}, Tail);
 %% @todo headers when local!=idle
 %% Send a response body chunk.
-%%
-%% @todo WINDOW_UPDATE stuff require us to buffer some data.
-%%
-%% When the body is sent using sendfile, the current solution is not
-%% very good. The body could be too large, blocking the connection.
-%% Also sendfile technically only works over TCP, so it's not that
-%% useful for HTTP/2. At the very least the sendfile call should be
-%% split into multiple calls and flow control should be used to make
-%% sure we only send as fast as the client can receive and don't block
-%% anything.
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 	{State, Stream} = send_data(State0, Stream0, IsFin, Data),
 	commands(State, Stream, Tail);
@@ -509,16 +497,6 @@ commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 %% @todo data when local!=nofin
 
 %% Send a file.
-%%
-%% @todo This implementation is terrible. A good implementation would
-%% need to check that Bytes is exact (or we need to document that we
-%% trust it to be exact), and would need to send the file asynchronously
-%% in many data frames. Perhaps a sendfile call should result in a
-%% process being created specifically for this purpose. Or perhaps
-%% the protocol should be "dumb" and the stream handler be the one
-%% to ensure the file is sent in chunks (which would require a better
-%% flow control at the stream handler level). One thing for sure, the
-%% implementation necessarily varies between HTTP/1.1 and HTTP/2.
 commands(State0, Stream0=#stream{local=nofin},
 		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
 	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
@@ -776,12 +754,12 @@ stream_handler_init(State=#state{opts=Opts,
 					remote=RemoteIsFin, local=LocalIsFin,
 					local_window=LocalWindow, remote_window=RemoteWindow},
 				Commands)
-	catch Class:Reason ->
-		error_logger:error_msg("Exception occurred in "
-			"cowboy_stream:init(~p, ~p, ~p) with reason ~p:~p.",
-			[StreamID, Req, Opts, Class, Reason]),
-		stream_reset(State, StreamID, {internal_error, {Class, Reason},
-			'Exception occurred in cowboy_stream:init/3.'})
+	catch Class:Exception ->
+		cowboy_stream:report_error(init,
+			[StreamID, Req, Opts],
+			Class, Exception, erlang:get_stacktrace()),
+		stream_reset(State, StreamID, {internal_error, {Class, Exception},
+			'Unhandled exception in cowboy_stream:init/3.'})
 	end.
 
 %% @todo We might need to keep track of which stream has been reset so we don't send lots of them.
@@ -823,19 +801,21 @@ stream_terminate(State=#state{socket=Socket, transport=Transport,
 			stream_call_terminate(StreamID, Reason, StreamState),
 			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=Streams, children=Children};
+		%% The stream doesn't exist. This can occur for various reasons.
+		%% It can happen before the stream has been created, or because
+		%% the cowboy_stream:init call failed, in which case doing nothing
+		%% is correct.
 		false ->
-			%% @todo Unknown stream. Not sure what to do here. Check again once all
-			%% terminate calls have been written.
 			State
 	end.
 
 stream_call_terminate(StreamID, Reason, StreamState) ->
 	try
 		cowboy_stream:terminate(StreamID, Reason, StreamState)
-	catch Class:Reason ->
-		error_logger:error_msg("Exception occurred in "
-			"cowboy_stream:terminate(~p, ~p, ~p) with reason ~p:~p.",
-			[StreamID, Reason, StreamState, Class, Reason])
+	catch Class:Exception ->
+		cowboy_stream:report_error(terminate,
+			[StreamID, Reason, StreamState],
+			Class, Exception, erlang:get_stacktrace())
 	end.
 
 %% Headers encode/decode.

@@ -52,18 +52,10 @@
 	name = undefined :: binary() | undefined
 }).
 
-%% @todo We need a state where we wait for the stream process to ask for the body.
-%% OR DO WE
-
-%% In HTTP/2 we start receiving data before the body asks for it, even if optionally
-%% (and by default), so we need to be able to do the same for HTTP/1.1 too. This means
-%% that when we receive data (up to a certain limit, we read from the socket and decode.
-%% When we reach a limit, we stop reading from the socket momentarily until the stream
-%% process asks for more or the stream ends.
-
-%% This means that we need to keep a buffer in the stream handler (until the stream
-%% process asks for it). And that we need the body state to indicate how much we have
-%% left to read (and stop/start reading from the socket depending on value).
+%% @todo We need a state where we wait for the stream process to ask for the body
+%% and do not attempt to read from the socket while in that state (we should read
+%% up to a certain length, and then wait, basically implementing flow control but
+%% by not reading from the socket when the window is empty).
 
 -record(ps_body, {
 	%% @todo flow
@@ -134,9 +126,6 @@ init(Parent, Ref, Socket, Transport, Opts) ->
 			%% Couldn't read the peer address; connection is gone.
 			terminate(undefined, {socket_error, Reason, 'An error has occurred on the socket.'})
 	end.
-
-%% @todo Send a response depending on in_state and whether one was already sent.
-%% @todo If we skip the body, skip for a specific duration.
 
 before_loop(State=#state{socket=Socket, transport=Transport}, Buffer) ->
 	%% @todo disable this when we get to the body, until the stream asks for it?
@@ -259,14 +248,13 @@ after_parse({request, Req=#{streamid := StreamID, headers := Headers, version :=
 			end,
 			State = set_timeout(State1),
 			parse(Buffer, commands(State, StreamID, Commands))
-	catch Class:Reason ->
-		error_logger:error_msg("Exception occurred in "
-			"cowboy_stream:init(~p, ~p, ~p) with reason ~p:~p.",
-			[StreamID, Req, Opts, Class, Reason]),
-		ok %% @todo send a proper response, etc. note that terminate must NOT be called
-		%% @todo Status code.
-%		stream_reset(State, StreamID, {internal_error, {Class, Reason},
-%			'Exception occurred in StreamHandler:init/10 call.'}) %% @todo Check final arity.
+	catch Class:Exception ->
+		cowboy_stream:report_error(init,
+			[StreamID, Req, Opts],
+			Class, Exception, erlang:get_stacktrace()),
+		early_error(500, State0, {internal_error, {Class, Exception},
+			'Unhandled exception in cowboy_stream:init/3.'}, Req),
+		parse(Buffer, State0)
 	end;
 %% Streams are sequential so the body is always about the last stream created
 %% unless that stream has terminated.
@@ -277,15 +265,12 @@ after_parse({data, StreamID, IsFin, Data, State=#state{
 			Streams = lists:keyreplace(StreamID, #stream.id, Streams0,
 				Stream#stream{state=StreamState}),
 			parse(Buffer, commands(State#state{streams=Streams}, StreamID, Commands))
-	catch Class:Reason ->
-		error_logger:error_msg("Exception occurred in "
-			"cowboy_stream:data(~p, ~p, ~p, ~p) with reason ~p:~p.",
-			[StreamID, IsFin, Data, StreamState0, Class, Reason]),
-		%% @todo Bad value returned here. Crashes.
-		ok
-		%% @todo
-%		stream_reset(State, StreamID, {internal_error, {Class, Reason},
-%			'Exception occurred in StreamHandler:data/4 call.'})
+	catch Class:Exception ->
+		cowboy_stream:report_error(data,
+			[StreamID, IsFin, Data, StreamState0],
+			Class, Exception, erlang:get_stacktrace()),
+		stream_reset(State, StreamID, {internal_error, {Class, Exception},
+			'Unhandled exception in cowboy_stream:data/4.'})
 	end;
 %% No corresponding stream, skip.
 after_parse({data, _, _, _, State, Buffer}) ->
@@ -608,7 +593,6 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, in_stream
 		scheme => Scheme,
 		host => Host,
 		port => Port,
-		%% @todo The path component needs to be normalized.
 		path => Path,
 		qs => Qs,
 		version => Version,
@@ -623,7 +607,6 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, in_stream
 			State = case HasBody of
 				true ->
 					State0#state{in_state=#ps_body{
-						%% @todo Don't need length anymore?
 						transfer_decode_fun = TDecodeFun,
 						transfer_decode_state = TDecodeState
 					}};
@@ -659,8 +642,6 @@ is_http2_upgrade(#{<<"connection">> := Conn, <<"upgrade">> := Upgrade,
 is_http2_upgrade(_, _) ->
 	false.
 
-%% Upgrade through an HTTP/1.1 request.
-
 %% Prior knowledge upgrade, without an HTTP/1.1 request.
 http2_upgrade(State=#state{parent=Parent, ref=Ref, socket=Socket, transport=Transport,
 		opts=Opts, peer=Peer}, Buffer) ->
@@ -673,6 +654,7 @@ http2_upgrade(State=#state{parent=Parent, ref=Ref, socket=Socket, transport=Tran
 				'Clients that support HTTP/2 over TLS MUST use ALPN. (RFC7540 3.4)'})
 	end.
 
+%% Upgrade via an HTTP/1.1 request.
 http2_upgrade(State=#state{parent=Parent, ref=Ref, socket=Socket, transport=Transport,
 		opts=Opts, peer=Peer}, Buffer, HTTP2Settings, Req) ->
 	%% @todo
@@ -709,11 +691,13 @@ parse_body(Buffer, State=#state{in_streamid=StreamID, in_state=
 			%% @todo Asks for 0 or more bytes.
 			{data, StreamID, nofin, Data, State#state{in_state=
 				PS#ps_body{transfer_decode_state=TState}}, Rest};
-		{done, TotalLength, Rest} ->
-			{data, StreamID, {fin, TotalLength}, <<>>, set_timeout(
+		%% @todo We probably want to confirm that the total length
+		%% is the same as the content-length, if one was provided.
+		{done, _TotalLength, Rest} ->
+			{data, StreamID, fin, <<>>, set_timeout(
 				State#state{in_streamid=StreamID + 1, in_state=#ps_request_line{}}), Rest};
-		{done, Data, TotalLength, Rest} ->
-			{data, StreamID, {fin, TotalLength}, Data, set_timeout(
+		{done, Data, _TotalLength, Rest} ->
+			{data, StreamID, fin, Data, set_timeout(
 				State#state{in_streamid=StreamID + 1, in_state=#ps_request_line{}}), Rest}
 	end.
 
@@ -741,14 +725,12 @@ info(State=#state{streams=Streams0}, StreamID, Msg) ->
 					Streams = lists:keyreplace(StreamID, #stream.id, Streams0,
 						Stream#stream{state=StreamState}),
 					commands(State#state{streams=Streams}, StreamID, Commands)
-			catch Class:Reason ->
-				error_logger:error_msg("Exception occurred in "
-					"cowboy_stream:info(~p, ~p, ~p) with reason ~p:~p.",
-					[StreamID, Msg, StreamState0, Class, Reason]),
-				ok
-%% @todo
-%				stream_reset(State, StreamID, {internal_error, {Class, Reason},
-%					'Exception occurred in StreamHandler:info/3 call.'})
+			catch Class:Exception ->
+				cowboy_stream:report_error(info,
+					[StreamID, Msg, StreamState0],
+					Class, Exception, erlang:get_stacktrace()),
+				stream_reset(State, StreamID, {internal_error, {Class, Exception},
+					'Unhandled exception in cowboy_stream:info/3.'})
 			end;
 		false ->
 			error_logger:error_msg("Received message ~p for unknown stream ~p.~n", [Msg, StreamID]),
@@ -947,6 +929,8 @@ stream_terminate(State0=#state{socket=Socket, transport=Transport,
 	{value, #stream{state=StreamState, version=Version}, Streams}
 		= lists:keytake(StreamID, #stream.id, Streams0),
 	State1 = case OutState of
+		wait when element(1, Reason) =:= internal_error ->
+			info(State0, StreamID, {response, 500, #{<<"content-length">> => <<"0">>}, <<>>});
 		wait ->
 			info(State0, StreamID, {response, 204, #{}, <<>>});
 		chunked when Version =:= 'HTTP/1.1' ->
@@ -984,10 +968,10 @@ stream_terminate(State0=#state{socket=Socket, transport=Transport,
 stream_call_terminate(StreamID, Reason, StreamState) ->
 	try
 		cowboy_stream:terminate(StreamID, Reason, StreamState)
-	catch Class:Reason ->
-		error_logger:error_msg("Exception occurred in "
-			"cowboy_stream:terminate(~p, ~p, ~p) with reason ~p:~p.",
-			[StreamID, Reason, StreamState, Class, Reason])
+	catch Class:Exception ->
+		cowboy_stream:report_error(terminate,
+			[StreamID, Reason, StreamState],
+			Class, Exception, erlang:get_stacktrace())
 	end.
 
 %% @todo max_reqs also
@@ -1032,8 +1016,7 @@ connection_hd_is_close(Conn) ->
 
 %% This function is only called when an error occurs on a new stream.
 -spec error_terminate(cowboy:http_status(), #state{}, _) -> no_return().
-error_terminate(StatusCode0, State=#state{ref=Ref, socket=Socket, transport=Transport,
-		opts=Opts, peer=Peer, in_streamid=StreamID, in_state=StreamState}, Reason) ->
+error_terminate(StatusCode, State=#state{ref=Ref, peer=Peer, in_state=StreamState}, Reason) ->
 	PartialReq = case StreamState of
 		#ps_request_line{} ->
 			#{};
@@ -1051,16 +1034,28 @@ error_terminate(StatusCode0, State=#state{ref=Ref, socket=Socket, transport=Tran
 			end
 		}
 	end,
-	{response, StatusCode, RespHeaders, RespBody}
-		= cowboy_stream:early_error(StreamID, Reason, PartialReq,
-			{response, StatusCode0, #{
-				<<"content-length">> => <<"0">>
-			}, <<>>}, Opts),
-	Transport:send(Socket, [
-		cow_http:response(StatusCode, 'HTTP/1.1', maps:to_list(RespHeaders)),
-		RespBody
-	]),
+	early_error(StatusCode, State, Reason, PartialReq),
 	terminate(State, Reason).
+
+early_error(StatusCode0, #state{socket=Socket, transport=Transport,
+		opts=Opts, in_streamid=StreamID}, Reason, PartialReq) ->
+	Resp = {response, StatusCode0, RespHeaders0=#{<<"content-length">> => <<"0">>}, <<>>},
+	try cowboy_stream:early_error(StreamID, Reason, PartialReq, Resp, Opts) of
+		{response, StatusCode, RespHeaders, RespBody} ->
+			Transport:send(Socket, [
+				cow_http:response(StatusCode, 'HTTP/1.1', maps:to_list(RespHeaders)),
+				RespBody
+			])
+	catch Class:Exception ->
+		cowboy_stream:report_error(early_error,
+			[StreamID, Reason, PartialReq, Resp, Opts],
+			Class, Exception, erlang:get_stacktrace()),
+		%% We still need to send an error response, so send what we initially
+		%% wanted to send. It's better than nothing.
+		Transport:send(Socket, cow_http:response(StatusCode0,
+			'HTTP/1.1', maps:to_list(RespHeaders0)))
+	end,
+	ok.
 
 -spec terminate(_, _) -> no_return().
 terminate(undefined, Reason) ->
