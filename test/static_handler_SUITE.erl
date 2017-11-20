@@ -83,8 +83,9 @@ end_per_suite(Config) ->
 	%% Static directories.
 	StaticDir = config(static_dir, Config),
 	PrivDir = code:priv_dir(ct_helper) ++ "/static",
-	ok = file:delete(StaticDir ++ "/large.bin"),
-	ok = file:delete(PrivDir ++ "/large.bin"),
+	%% This file is not created on Windows.
+	_ = file:delete(StaticDir ++ "/large.bin"),
+	_ = file:delete(PrivDir ++ "/large.bin"),
 	ct_helper:delete_static_dir(StaticDir),
 	ct_helper:delete_static_dir(PrivDir).
 
@@ -354,7 +355,9 @@ dir_error_directory_slash(Config) ->
 
 dir_error_doesnt_exist(Config) ->
 	doc("Try to get a file that does not exist."),
-	{404, _, _} = do_get(config(prefix, Config) ++ "/not.found", Config),
+	%% @todo Check that the content-type header is removed.
+	{404, _Headers, _} = do_get(config(prefix, Config) ++ "/not.found", Config),
+%	false = lists:keyfind(<<"content-type">>, 1, Headers),
 	ok.
 
 dir_error_dot(Config) ->
@@ -797,7 +800,7 @@ unicode_basic_error(Config) ->
 		http2 -> "#?"
 	end,
 	_ = [case do_get("/char/" ++ [C], Config) of
-		{500, _, _} -> ok;
+		{400, _, _} -> ok;
 		Error -> exit({error, C, Error})
 	end || C <- (config(chars, Config) -- Exclude) --
 		"abcdefghijklmnopqrstuvwxyz"

@@ -54,6 +54,7 @@ init_dispatch(Config) ->
 		{"/opts/:key/length", echo_h, #{length => 1000}},
 		{"/opts/:key/period", echo_h, #{length => 999999999, period => 1000}},
 		{"/opts/:key/timeout", echo_h, #{timeout => 1000, crash => true}},
+		{"/100-continue/:key", echo_h, []},
 		{"/full/:key", echo_h, []},
 		{"/no/:key", echo_h, []},
 		{"/direct/:key/[...]", echo_h, []},
@@ -114,6 +115,30 @@ do_get_body(Path, Config) ->
 do_get_body(Path, Headers, Config) ->
 	do_body("GET", Path, Headers, Config).
 
+do_get_inform(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	case gun:await(ConnPid, Ref) of
+		{response, _, RespStatus, RespHeaders} ->
+			%% We don't care about the body.
+			gun:close(ConnPid),
+			{RespStatus, RespHeaders};
+		{inform, InfoStatus, InfoHeaders} ->
+			{response, IsFin, RespStatus, RespHeaders}
+				= case gun:await(ConnPid, Ref) of
+					{inform, InfoStatus, InfoHeaders} ->
+						gun:await(ConnPid, Ref);
+					Response ->
+						Response
+			end,
+			{ok, RespBody} = case IsFin of
+				nofin -> gun:await_body(ConnPid, Ref);
+				fin -> {ok, <<>>}
+			end,
+			gun:close(ConnPid),
+			{InfoStatus, InfoHeaders, RespStatus, RespHeaders, do_decode(RespHeaders, RespBody)}
+	end.
+
 do_decode(Headers, Body) ->
 	case lists:keyfind(<<"content-encoding">>, 1, Headers) of
 		{_, <<"gzip">>} -> zlib:gunzip(Body);
@@ -132,6 +157,30 @@ binding(Config) ->
 bindings(Config) ->
 	doc("Values bound from request URI path."),
 	<<"#{key => <<\"bindings\">>}">> = do_get_body("/bindings", Config),
+	ok.
+
+cert(Config) ->
+	case config(type, Config) of
+		tcp -> doc("TLS certificates can only be provided over TLS.");
+		ssl -> do_cert(Config)
+	end.
+
+do_cert(Config0) ->
+	doc("A client TLS certificate was provided."),
+	{CaCert, Cert, Key} = ct_helper:make_certs(),
+	Config = [{transport_opts, [
+		{cert, Cert},
+		{key, Key},
+		{cacerts, [CaCert]}
+	]}|Config0],
+	Cert = do_get_body("/cert", Config),
+	Cert = do_get_body("/direct/cert", Config),
+	ok.
+
+cert_undefined(Config) ->
+	doc("No client TLS certificate was provided."),
+	<<"undefined">> = do_get_body("/cert", Config),
+	<<"undefined">> = do_get_body("/direct/cert", Config),
 	ok.
 
 header(Config) ->
@@ -274,7 +323,7 @@ path_info(Config) ->
 	ok.
 
 peer(Config) ->
-	doc("Request peer."),
+	doc("Remote socket address."),
 	<<"{{127,0,0,1},", _/bits >> = do_get_body("/peer", Config),
 	<<"{{127,0,0,1},", _/bits >> = do_get_body("/direct/peer", Config),
 	ok.
@@ -308,6 +357,12 @@ do_scheme(Path, Config) ->
 		<<"http">> when Transport =:= tcp -> ok;
 		<<"https">> when Transport =:= ssl -> ok
 	end.
+
+sock(Config) ->
+	doc("Local socket address."),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/sock", Config),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/direct/sock", Config),
+	ok.
 
 uri(Config) ->
 	doc("Request URI building/modification."),
@@ -401,6 +456,33 @@ do_read_body_timeout(Path, Body, Config) ->
 	]),
 	{response, _, 500, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
+
+read_body_expect_100_continue(Config) ->
+	doc("Request body with a 100-continue expect header."),
+	do_read_body_expect_100_continue("/read_body", Config).
+
+read_body_expect_100_continue_user_sent(Config) ->
+	doc("Request body with a 100-continue expect header, 100 response sent by handler."),
+	do_read_body_expect_100_continue("/100-continue/read_body", Config).
+
+do_read_body_expect_100_continue(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Body = <<0:8000000>>,
+	Headers = [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"expect">>, <<"100-continue">>},
+		{<<"content-length">>, integer_to_binary(byte_size(Body))}
+	],
+	Ref = gun:post(ConnPid, Path, Headers),
+	{inform, 100, []} = gun:await(ConnPid, Ref),
+	gun:data(ConnPid, Ref, fin, Body),
+	{response, IsFin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	{ok, RespBody} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref);
+		fin -> {ok, <<>>}
+	end,
+	gun:close(ConnPid),
+	do_decode(RespHeaders, RespBody).
 
 read_urlencoded_body(Config) ->
 	doc("application/x-www-form-urlencoded request body."),
@@ -673,6 +755,23 @@ delete_resp_header(Config) ->
 	false = lists:keymember(<<"content-type">>, 1, Headers),
 	ok.
 
+inform2(Config) ->
+	doc("Informational response(s) without headers, followed by the real response."),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/102", Config),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/binary", Config),
+	{500, _} = do_get_inform("/resp/inform2/error", Config),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/twice", Config),
+	ok.
+
+inform3(Config) ->
+	doc("Informational response(s) with headers, followed by the real response."),
+	Headers = [{<<"ext-header">>, <<"ext-value">>}],
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/102", Config),
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/binary", Config),
+	{500, _} = do_get_inform("/resp/inform3/error", Config),
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/twice", Config),
+	ok.
+
 reply2(Config) ->
 	doc("Response with default headers and no body."),
 	{200, _, _} = do_get("/resp/reply2/200", Config),
@@ -728,9 +827,58 @@ stream_reply3(Config) ->
 	{500, _, _} = do_get("/resp/stream_reply3/error", Config),
 	ok.
 
+stream_body_multiple(Config) ->
+	doc("Streamed body via multiple calls."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/multiple", Config),
+	ok.
+
+stream_body_fin0(Config) ->
+	doc("Streamed body with last chunk of size 0."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/fin0", Config),
+	ok.
+
+stream_body_nofin(Config) ->
+	doc("Unfinished streamed body."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/nofin", Config),
+	ok.
+
 %% @todo Crash when calling stream_body after the fin flag has been set.
 %% @todo Crash when calling stream_body after calling reply.
 %% @todo Crash when calling stream_body before calling stream_reply.
+
+stream_trailers(Config) ->
+	doc("Stream body followed by trailer headers."),
+	{200, RespHeaders, <<"Hello world!">>, [
+		{<<"grpc-status">>, <<"0">>}
+	]} = do_trailers("/resp/stream_trailers", Config),
+	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),
+	ok.
+
+stream_trailers_no_te(Config) ->
+	doc("Stream body followed by trailer headers."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/stream_trailers", [
+		{<<"accept-encoding">>, <<"gzip">>}
+	]),
+	{response, nofin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	{ok, RespBody} = gun:await_body(ConnPid, Ref),
+	gun:close(ConnPid).
+
+do_trailers(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"te">>, <<"trailers">>}
+	]),
+	{response, nofin, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	{ok, RespBody, Trailers} = gun:await_body(ConnPid, Ref),
+	gun:close(ConnPid),
+	{Status, RespHeaders, do_decode(RespHeaders, RespBody), Trailers}.
+
+%% @todo Crash when calling stream_trailers twice.
+%% @todo Crash when calling stream_trailers after the fin flag has been set.
+%% @todo Crash when calling stream_trailers after calling reply.
+%% @todo Crash when calling stream_trailers before calling stream_reply.
 
 %% Tests: Push.
 

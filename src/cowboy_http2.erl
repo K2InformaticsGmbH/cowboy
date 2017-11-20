@@ -15,8 +15,8 @@
 -module(cowboy_http2).
 
 -export([init/5]).
--export([init/7]).
 -export([init/9]).
+-export([init/11]).
 
 -export([system_continue/3]).
 -export([system_terminate/4]).
@@ -49,7 +49,9 @@
 	%% Whether we finished receiving data.
 	remote = nofin :: cowboy_stream:fin(),
 	%% Remote flow control window (how much we accept to receive).
-	remote_window :: integer()
+	remote_window :: integer(),
+	%% Unparsed te header. Used to know if we can send trailers.
+	te :: undefined | binary()
 }).
 
 -type stream() :: #stream{}.
@@ -63,6 +65,12 @@
 
 	%% Remote address and port for the connection.
 	peer = undefined :: {inet:ip_address(), inet:port_number()},
+
+	%% Local address and port for the connection.
+	sock = undefined :: {inet:ip_address(), inet:port_number()},
+
+	%% Client certificate (TLS only).
+	cert :: undefined | binary(),
 
 	%% Settings are separate for each endpoint. In addition, settings
 	%% must be acknowledged before they can be expected to be applied.
@@ -98,6 +106,10 @@
 	%% by the client or by the server through PUSH_PROMISE frames.
 	streams = [] :: [stream()],
 
+	%% HTTP/2 streams that have been reset recently. We are expected
+	%% to keep receiving additional frames after sending an RST_STREAM.
+	lingering_streams = [] :: [cowboy_stream:streamid()],
+
 	%% Streams can spawn zero or more children which are then managed
 	%% by this module if operating as a supervisor.
 	children = cowboy_children:init() :: cowboy_children:children(),
@@ -119,19 +131,39 @@
 
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts) ->
-	case Transport:peername(Socket) of
-		{ok, Peer} ->
-			init(Parent, Ref, Socket, Transport, Opts, Peer, <<>>);
-		{error, Reason} ->
-			%% Couldn't read the peer address; connection is gone.
-			terminate(undefined, {socket_error, Reason, 'An error has occurred on the socket.'})
+	Peer0 = Transport:peername(Socket),
+	Sock0 = Transport:sockname(Socket),
+	Cert1 = case Transport:name() of
+		ssl ->
+			case ssl:peercert(Socket) of
+				{error, no_peercert} ->
+					{ok, undefined};
+				Cert0 ->
+					Cert0
+			end;
+		_ ->
+			{ok, undefined}
+	end,
+	case {Peer0, Sock0, Cert1} of
+		{{ok, Peer}, {ok, Sock}, {ok, Cert}} ->
+			init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, <<>>);
+		{{error, Reason}, _, _} ->
+			terminate(undefined, {socket_error, Reason,
+				'A socket error occurred when retrieving the peer name.'});
+		{_, {error, Reason}, _} ->
+			terminate(undefined, {socket_error, Reason,
+				'A socket error occurred when retrieving the sock name.'});
+		{_, _, {error, Reason}} ->
+			terminate(undefined, {socket_error, Reason,
+				'A socket error occurred when retrieving the client TLS certificate.'})
 	end.
 
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts(),
-	{inet:ip_address(), inet:port_number()}, binary()) -> ok.
-init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer) ->
+	{inet:ip_address(), inet:port_number()}, {inet:ip_address(), inet:port_number()},
+	binary() | undefined, binary()) -> ok.
+init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer) ->
 	State = #state{parent=Parent, ref=Ref, socket=Socket,
-		transport=Transport, opts=Opts, peer=Peer,
+		transport=Transport, opts=Opts, peer=Peer, sock=Sock, cert=Cert,
 		parse_state={preface, sequence, preface_timeout(Opts)}},
 	preface(State),
 	case Buffer of
@@ -141,10 +173,11 @@ init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer) ->
 
 %% @todo Add an argument for the request body.
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts(),
-	{inet:ip_address(), inet:port_number()}, binary(), map() | undefined, cowboy_req:req()) -> ok.
-init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer, _Settings, Req) ->
+	{inet:ip_address(), inet:port_number()}, {inet:ip_address(), inet:port_number()},
+	binary() | undefined, binary(), map() | undefined, cowboy_req:req()) -> ok.
+init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer, _Settings, Req) ->
 	State0 = #state{parent=Parent, ref=Ref, socket=Socket,
-		transport=Transport, opts=Opts, peer=Peer,
+		transport=Transport, opts=Opts, peer=Peer, sock=Sock, cert=Cert,
 		parse_state={preface, sequence, preface_timeout(Opts)}},
 	%% @todo Apply settings.
 	%% StreamID from HTTP/1.1 Upgrade requests is always 1.
@@ -286,14 +319,12 @@ frame(State=#state{client_streamid=LastStreamID}, {data, StreamID, _, _})
 		when StreamID > LastStreamID ->
 	terminate(State, {connection_error, protocol_error,
 		'DATA frame received on a stream in idle state. (RFC7540 5.1)'});
-frame(State0=#state{remote_window=ConnWindow, streams=Streams},
+frame(State0=#state{remote_window=ConnWindow, streams=Streams, lingering_streams=Lingering},
 		{data, StreamID, IsFin, Data}) ->
 	DataLen = byte_size(Data),
 	State = State0#state{remote_window=ConnWindow - DataLen},
 	case lists:keyfind(StreamID, #stream.id, Streams) of
 		Stream = #stream{state=flush, remote=nofin, remote_window=StreamWindow} ->
-			%% @todo We need to cancel streams that we don't want to receive
-			%% the full body from after we finish flushing the response.
 			after_commands(State, Stream#stream{remote=IsFin, remote_window=StreamWindow - DataLen});
 		Stream = #stream{state=StreamState0, remote=nofin, remote_window=StreamWindow} ->
 			try cowboy_stream:data(StreamID, IsFin, Data, StreamState0) of
@@ -311,9 +342,17 @@ frame(State0=#state{remote_window=ConnWindow, streams=Streams},
 			stream_reset(State, StreamID, {stream_error, stream_closed,
 				'DATA frame received for a half-closed (remote) stream. (RFC7540 5.1)'});
 		false ->
-			%% @todo What about RST_STREAM? Sigh.
-			terminate(State, {connection_error, stream_closed,
-				'DATA frame received for a closed stream. (RFC7540 5.1)'})
+			%% After we send an RST_STREAM frame and terminate a stream,
+			%% the client still might be sending us some more frames
+			%% until it can process this RST_STREAM. We therefore ignore
+			%% DATA frames received for such lingering streams.
+			case lists:member(StreamID, Lingering) of
+				true ->
+					State0;
+				false ->
+					terminate(State, {connection_error, stream_closed,
+						'DATA frame received for a closed stream. (RFC7540 5.1)'})
+			end
 	end;
 %% HEADERS frame with invalid even-numbered streamid.
 frame(State, {headers, StreamID, _, _, _}) when StreamID rem 2 =:= 0 ->
@@ -458,6 +497,13 @@ commands(State, Stream=#stream{local=idle}, [{error_response, StatusCode, Header
 	commands(State, Stream, [{response, StatusCode, Headers, Body}|Tail]);
 commands(State, Stream, [{error_response, _, _, _}|Tail]) ->
 	commands(State, Stream, Tail);
+%% Send an informational response.
+commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+		Stream=#stream{id=StreamID, local=idle}, [{inform, StatusCode, Headers0}|Tail]) ->
+	Headers = Headers0#{<<":status">> => status(StatusCode)},
+	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
+	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
+	commands(State#state{encode_state=EncodeState}, Stream, Tail);
 %% Send response headers.
 %%
 %% @todo Kill the stream if it sent a response when one has already been sent.
@@ -493,9 +539,24 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 	{State, Stream} = send_data(State0, Stream0, IsFin, Data),
 	commands(State, Stream, Tail);
-
 %% @todo data when local!=nofin
-
+%% Send trailers.
+commands(State0, Stream0=#stream{local=nofin, te=TE0}, [{trailers, Trailers}|Tail]) ->
+	%% We only accept TE headers containing exactly "trailers" (RFC7540 8.1.2.1).
+	TE = try cow_http_hd:parse_te(TE0) of
+		{trailers, []} -> trailers;
+		_ -> no_trailers
+	catch _:_ ->
+		%% If we can't parse the TE header, assume we can't send trailers.
+		no_trailers
+	end,
+	{State, Stream} = case TE of
+		trailers ->
+			send_data(State0, Stream0, fin, {trailers, Trailers});
+		no_trailers ->
+			send_data(State0, Stream0, fin, <<>>)
+	end,
+	commands(State, Stream, Tail);
 %% Send a file.
 commands(State0, Stream0=#stream{local=nofin},
 		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
@@ -574,9 +635,6 @@ status(Status) when is_integer(Status) ->
 status(<< H, T, U, _/bits >>) when H >= $1, H =< $9, T >= $0, T =< $9, U >= $0, U =< $9 ->
 	<< H, T, U >>.
 
-
-
-
 %% @todo Should we ever want to implement the PRIORITY mechanism,
 %% this would be the place to do it. Right now, we just go over
 %% all streams and send what we can until either everything is
@@ -584,7 +642,6 @@ status(<< H, T, U, _/bits >>) when H >= $1, H =< $9, T >= $0, T =< $9, U >= $0, 
 send_data(State=#state{streams=Streams}) ->
 	resume_streams(State, Streams, []).
 
-%% @todo When streams terminate we need to remove the stream.
 resume_streams(State, [], Acc) ->
 	State#state{streams=lists:reverse(Acc)};
 %% While technically we should never get < 0 here, let's be on the safe side.
@@ -593,8 +650,18 @@ resume_streams(State=#state{local_window=ConnWindow}, Streams, Acc)
 	State#state{streams=lists:reverse(Acc, Streams)};
 %% We rely on send_data/2 to do all the necessary checks about the stream.
 resume_streams(State0, [Stream0|Tail], Acc) ->
-	{State, Stream} = send_data(State0, Stream0),
-	resume_streams(State, Tail, [Stream|Acc]).
+	{State1, Stream} = send_data(State0, Stream0),
+	case Stream of
+		%% We are done flushing, remove the stream.
+		%% Maybe skip the request body if it was not fully read.
+		#stream{state=flush, local=fin} ->
+			State = maybe_skip_body(State1, Stream, normal),
+			resume_streams(State, Tail, Acc);
+		%% Keep the stream. Either the stream handler is still running,
+		%% or we are not finished flushing.
+		_ ->
+			resume_streams(State1, Tail, [Stream|Acc])
+	end.
 
 %% @todo We might want to print an error if local=fin.
 %%
@@ -614,6 +681,12 @@ send_data(State0, Stream0=#stream{local_buffer=Q0, local_buffer_size=BufferSize}
 send_data(State, Stream, IsFin, Data) ->
 	send_data(State, Stream, IsFin, Data, in).
 
+%% Always send trailer frames even if the window is empty.
+send_data(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+		Stream=#stream{id=StreamID}, fin, {trailers, Trailers}, _) ->
+	{HeaderBlock, EncodeState} = headers_encode(Trailers, EncodeState0),
+	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
+	{State#state{encode_state=EncodeState}, Stream#stream{local=fin}};
 %% Send data immediately if we can, buffer otherwise.
 %% @todo We might want to print an error if local=fin.
 send_data(State=#state{local_window=ConnWindow},
@@ -704,9 +777,10 @@ stream_decode_init(State=#state{socket=Socket, transport=Transport,
 			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'})
 	end.
 
-stream_req_init(State=#state{ref=Ref, peer=Peer}, StreamID, IsFin, Headers0=#{
-		<<":method">> := Method, <<":scheme">> := Scheme,
-		<<":authority">> := Authority, <<":path">> := PathWithQs}) ->
+stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
+		StreamID, IsFin, Headers0=#{
+			<<":method">> := Method, <<":scheme">> := Scheme,
+			<<":authority">> := Authority, <<":path">> := PathWithQs}) ->
 	Headers = maps:without([<<":method">>, <<":scheme">>, <<":authority">>, <<":path">>], Headers0),
 	BodyLength = case Headers of
 		_ when IsFin =:= fin ->
@@ -723,6 +797,7 @@ stream_req_init(State=#state{ref=Ref, peer=Peer}, StreamID, IsFin, Headers0=#{
 		_ ->
 			undefined
 	end,
+	%% @todo If this fails to parse we want to gracefully handle the crash.
 	{Host, Port} = cow_http_hd:parse_host(Authority),
 	{Path, Qs} = cow_http:parse_fullpath(PathWithQs),
 	Req = #{
@@ -730,6 +805,8 @@ stream_req_init(State=#state{ref=Ref, peer=Peer}, StreamID, IsFin, Headers0=#{
 		pid => self(),
 		streamid => StreamID,
 		peer => Peer,
+		sock => Sock,
+		cert => Cert,
 		method => Method,
 		scheme => Scheme,
 		host => Host,
@@ -746,13 +823,14 @@ stream_req_init(State=#state{ref=Ref, peer=Peer}, StreamID, IsFin, Headers0=#{
 stream_handler_init(State=#state{opts=Opts,
 		local_settings=#{initial_window_size := RemoteWindow},
 		remote_settings=#{initial_window_size := LocalWindow}},
-		StreamID, RemoteIsFin, LocalIsFin, Req) ->
+		StreamID, RemoteIsFin, LocalIsFin, Req=#{headers := Headers}) ->
 	try cowboy_stream:init(StreamID, Req, Opts) of
 		{Commands, StreamState} ->
 			commands(State#state{client_streamid=StreamID},
 				#stream{id=StreamID, state=StreamState,
 					remote=RemoteIsFin, local=LocalIsFin,
-					local_window=LocalWindow, remote_window=RemoteWindow},
+					local_window=LocalWindow, remote_window=RemoteWindow,
+					te=maps:get(<<"te">>, Headers, undefined)},
 				Commands)
 	catch Class:Exception ->
 		cowboy_stream:report_error(init,
@@ -762,42 +840,54 @@ stream_handler_init(State=#state{opts=Opts,
 			'Unhandled exception in cowboy_stream:init/3.'})
 	end.
 
-%% @todo We might need to keep track of which stream has been reset so we don't send lots of them.
-stream_reset(State=#state{socket=Socket, transport=Transport}, StreamID,
-		StreamError={internal_error, _, _}) ->
-	Transport:send(Socket, cow_http2:rst_stream(StreamID, internal_error)),
-	stream_terminate(State, StreamID, StreamError);
-stream_reset(State=#state{socket=Socket, transport=Transport}, StreamID,
-		StreamError={stream_error, Reason, _}) ->
+%% @todo Don't send an RST_STREAM if one was already sent.
+stream_reset(State=#state{socket=Socket, transport=Transport}, StreamID, StreamError) ->
+	Reason = case StreamError of
+		{internal_error, _, _} -> internal_error;
+		{stream_error, Reason0, _} -> Reason0
+	end,
 	Transport:send(Socket, cow_http2:rst_stream(StreamID, Reason)),
-	stream_terminate(State, StreamID, StreamError).
+	stream_terminate(stream_linger(State, StreamID), StreamID, StreamError).
 
-stream_terminate(State=#state{socket=Socket, transport=Transport,
-		streams=Streams0, children=Children0}, StreamID, Reason) ->
+%% We only keep up to 100 streams in this state. @todo Make it configurable?
+stream_linger(State=#state{lingering_streams=Lingering0}, StreamID) ->
+	Lingering = [StreamID|lists:sublist(Lingering0, 100 - 1)],
+	State#state{lingering_streams=Lingering}.
+
+stream_terminate(State0=#state{streams=Streams0, children=Children0}, StreamID, Reason) ->
 	case lists:keytake(StreamID, #stream.id, Streams0) of
 		%% When the stream terminates normally (without sending RST_STREAM)
 		%% and no response was sent, we need to send a proper response back to the client.
-		{value, #stream{state=StreamState, local=idle}, Streams} when Reason =:= normal ->
-			State1 = info(State, StreamID, {response, 204, #{}, <<>>}),
+		{value, Stream=#stream{local=idle}, Streams} when Reason =:= normal ->
+			State1 = #state{streams=Streams1} = info(State0, StreamID, {response, 204, #{}, <<>>}),
+			State = maybe_skip_body(State1, Stream, Reason),
+			#stream{state=StreamState} = lists:keyfind(StreamID, #stream.id, Streams1),
 			stream_call_terminate(StreamID, Reason, StreamState),
 			Children = cowboy_children:shutdown(Children0, StreamID),
-			State1#state{streams=Streams, children=Children};
+			State#state{streams=Streams, children=Children};
 		%% When a response was sent but not terminated, we need to close the stream.
-		{value, #stream{state=StreamState, local=nofin, local_buffer_size=0}, Streams}
+		{value, Stream=#stream{local=nofin, local_buffer_size=0}, Streams}
 				when Reason =:= normal ->
-			Transport:send(Socket, cow_http2:data(StreamID, fin, <<>>)),
+			State1 = #state{streams=Streams1} = info(State0, StreamID, {data, fin, <<>>}),
+			State = maybe_skip_body(State1, Stream, Reason),
+			#stream{state=StreamState} = lists:keyfind(StreamID, #stream.id, Streams1),
 			stream_call_terminate(StreamID, Reason, StreamState),
 			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=Streams, children=Children};
 		%% Unless there is still data in the buffer. We can however reset
 		%% a few fields and set a special local state to avoid confusion.
+		%%
+		%% We do not reset the stream in this case (to skip the body)
+		%% because we are still sending data via the buffer. We will
+		%% reset the stream if necessary once the buffer is empty.
 		{value, Stream=#stream{state=StreamState, local=nofin}, Streams} ->
 			stream_call_terminate(StreamID, Reason, StreamState),
 			Children = cowboy_children:shutdown(Children0, StreamID),
-			State#state{streams=[Stream#stream{state=flush, local=flush}|Streams],
+			State0#state{streams=[Stream#stream{state=flush, local=flush}|Streams],
 				children=Children};
 		%% Otherwise we sent an RST_STREAM and/or the stream is already closed.
-		{value, #stream{state=StreamState}, Streams} ->
+		{value, Stream=#stream{state=StreamState}, Streams} ->
+			State = maybe_skip_body(State0, Stream, Reason),
 			stream_call_terminate(StreamID, Reason, StreamState),
 			Children = cowboy_children:shutdown(Children0, StreamID),
 			State#state{streams=Streams, children=Children};
@@ -806,8 +896,18 @@ stream_terminate(State=#state{socket=Socket, transport=Transport,
 		%% the cowboy_stream:init call failed, in which case doing nothing
 		%% is correct.
 		false ->
-			State
+			State0
 	end.
+
+%% When the stream stops normally without reading the request
+%% body fully we need to tell the client to stop sending it.
+%% We do this by sending an RST_STREAM with reason NO_ERROR. (RFC7540 8.1.0)
+maybe_skip_body(State=#state{socket=Socket, transport=Transport},
+		#stream{id=StreamID, remote=nofin}, normal) ->
+	Transport:send(Socket, cow_http2:rst_stream(StreamID, no_error)),
+	stream_linger(State, StreamID);
+maybe_skip_body(State, _, _) ->
+	State.
 
 stream_call_terminate(StreamID, Reason, StreamState) ->
 	try

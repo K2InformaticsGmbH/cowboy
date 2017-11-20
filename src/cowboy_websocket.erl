@@ -144,23 +144,27 @@ websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid},
 		[{<<"permessage-deflate">>, Params}|Tail], RespHeader) ->
 	%% @todo Make deflate options configurable.
 	Opts = #{level => best_compression, mem_level => 8, strategy => default},
-	case cow_ws:negotiate_permessage_deflate(Params, Extensions, Opts#{owner => Pid}) of
+	try cow_ws:negotiate_permessage_deflate(Params, Extensions, Opts#{owner => Pid}) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
 		ignore ->
 			websocket_extensions(State, Req, Tail, RespHeader)
+	catch exit:{error, incompatible_zlib_version, _} ->
+		websocket_extensions(State, Req, Tail, RespHeader)
 	end;
 websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid},
 		[{<<"x-webkit-deflate-frame">>, Params}|Tail], RespHeader) ->
 	%% @todo Make deflate options configurable.
 	Opts = #{level => best_compression, mem_level => 8, strategy => default},
-	case cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, Opts#{owner => Pid}) of
+	try cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, Opts#{owner => Pid}) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
 		ignore ->
 			websocket_extensions(State, Req, Tail, RespHeader)
+	catch exit:{error, incompatible_zlib_version, _} ->
+		websocket_extensions(State, Req, Tail, RespHeader)
 	end;
 websocket_extensions(State, Req, [_|Tail], RespHeader) ->
 	websocket_extensions(State, Req, Tail, RespHeader).
@@ -172,6 +176,7 @@ websocket_handshake(State=#state{key=Key},
 		Req=#{pid := Pid, streamid := StreamID}, HandlerState, Env) ->
 	Challenge = base64:encode(crypto:hash(sha,
 		<< Key/binary, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" >>)),
+	%% @todo We don't want date and server headers.
 	Headers = cowboy_req:response_headers(#{
 		<<"connection">> => <<"Upgrade">>,
 		<<"upgrade">> => <<"websocket">>,

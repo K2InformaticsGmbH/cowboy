@@ -19,6 +19,8 @@
 -export([method/1]).
 -export([version/1]).
 -export([peer/1]).
+-export([sock/1]).
+-export([cert/1]).
 -export([scheme/1]).
 -export([host/1]).
 -export([host_info/1]).
@@ -69,6 +71,8 @@
 -export([set_resp_body/2]).
 %% @todo set_resp_body/3 with a ContentType or even Headers argument, to set content headers.
 -export([has_resp_body/1]).
+-export([inform/2]).
+-export([inform/3]).
 -export([reply/2]).
 -export([reply/3]).
 -export([reply/4]).
@@ -77,6 +81,7 @@
 %% @todo stream_body/2 (nofin)
 -export([stream_body/3]).
 %% @todo stream_event/2,3
+-export([stream_trailers/2]).
 -export([push/3]).
 -export([push/4]).
 
@@ -150,6 +155,14 @@ version(#{version := Version}) ->
 -spec peer(req()) -> {inet:ip_address(), inet:port_number()}.
 peer(#{peer := Peer}) ->
 	Peer.
+
+-spec sock(req()) -> {inet:ip_address(), inet:port_number()}.
+sock(#{sock := Sock}) ->
+	Sock.
+
+-spec cert(req()) -> binary() | undefined.
+cert(#{cert := Cert}) ->
+	Cert.
 
 -spec scheme(req()) -> binary().
 scheme(#{scheme := Scheme}) ->
@@ -675,6 +688,18 @@ has_resp_body(_) ->
 delete_resp_header(Name, Req=#{resp_headers := RespHeaders}) ->
 	Req#{resp_headers => maps:remove(Name, RespHeaders)}.
 
+-spec inform(cowboy:http_status(), req()) -> ok.
+inform(Status, Req) ->
+	inform(Status, #{}, Req).
+
+-spec inform(cowboy:http_status(), cowboy:http_headers(), req()) -> ok.
+inform(_, _, #{has_sent_resp := _}) ->
+	error(function_clause); %% @todo Better error message.
+inform(Status, Headers, #{pid := Pid, streamid := StreamID})
+		when is_integer(Status); is_binary(Status) ->
+	Pid ! {{Pid, StreamID}, {inform, Status, Headers}},
+	ok.
+
 -spec reply(cowboy:http_status(), Req) -> Req when Req::req().
 reply(Status, Req) ->
 	reply(Status, #{}, Req).
@@ -689,7 +714,7 @@ reply(Status, Headers, Req) ->
 -spec reply(cowboy:http_status(), cowboy:http_headers(), resp_body(), Req)
 	-> Req when Req::req().
 reply(_, _, _, #{has_sent_resp := _}) ->
-	error(function_clause);
+	error(function_clause); %% @todo Better error message.
 reply(Status, Headers, {sendfile, _, 0, _}, Req)
 		when is_integer(Status); is_binary(Status) ->
 	do_reply(Status, Headers#{
@@ -748,6 +773,11 @@ stream_body(Data, IsFin=nofin, #{pid := Pid, streamid := StreamID, has_sent_resp
 	end;
 stream_body(Data, IsFin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
 	Pid ! {{Pid, StreamID}, {data, IsFin, Data}},
+	ok.
+
+-spec stream_trailers(cowboy:http_headers(), req()) -> ok.
+stream_trailers(Trailers, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
+	Pid ! {{Pid, StreamID}, {trailers, Trailers}},
 	ok.
 
 -spec push(binary(), cowboy:http_headers(), req()) -> ok.
