@@ -14,6 +14,7 @@
 
 -module(h2spec_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
@@ -40,8 +41,8 @@ end_per_suite(_Config) ->
 
 init_dispatch() ->
 	cowboy_router:compile([
-		{"localhost", [
-			{"/", hello_h, []}
+		{'_', [
+			{"/", delay_hello_h, 500}
 		]}
 	]).
 

@@ -15,6 +15,7 @@
 
 -module(http_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(cowboy_test, [gun_open/1]).
@@ -34,12 +35,13 @@ all() ->
 		{group, http_compress},
 		{group, https_compress},
 		{group, parse_host},
-		{group, set_env}
+		{group, set_env},
+		{group, router_compile}
 	].
 
 groups() ->
 	Tests = ct_helper:all(?MODULE) -- [
-		parse_host, set_env_dispatch
+		parse_host, set_env_dispatch, path_allow_colon
 	],
 	[
 		{http, [], Tests}, %% @todo parallel
@@ -51,6 +53,9 @@ groups() ->
 		]},
 		{set_env, [], [
 			set_env_dispatch
+		]},
+		{router_compile, [], [
+			path_allow_colon
 		]}
 	].
 
@@ -84,14 +89,18 @@ init_per_group(set_env, Config) ->
 		env => #{dispatch => []}
 	}),
 	Port = ranch:get_port(set_env),
-	[{type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config].
+	[{type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config];
+init_per_group(router_compile, Config) ->
+	Config.
 
+end_per_group(router_compile, _) ->
+	ok;
 end_per_group(Name, _) ->
 	ok = cowboy:stop_listener(Name).
 
 %% Dispatch configuration.
 
-init_dispatch(Config) ->
+init_dispatch(_) ->
 	cowboy_router:compile([
 		{"localhost", [
 			{"/chunked_response", http_chunked, []},
@@ -307,19 +316,6 @@ http10_keepalive_forced(Config) ->
 		_ -> ok
 	end.
 
-keepalive_max(Config) ->
-	ConnPid = gun_open(Config),
-	Refs = [gun:get(ConnPid, "/", [{<<"connection">>, <<"keep-alive">>}])
-		|| _ <- lists:seq(1, 99)],
-	CloseRef = gun:get(ConnPid, "/", [{<<"connection">>, <<"keep-alive">>}]),
-	_ = [begin
-		{response, nofin, 200, Headers} = gun:await(ConnPid, Ref),
-		false = lists:keymember(<<"connection">>, 1, Headers)
-	end || Ref <- Refs],
-	{response, nofin, 200, Headers} = gun:await(ConnPid, CloseRef),
-	{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, Headers),
-	gun_down(ConnPid).
-
 keepalive_nl(Config) ->
 	ConnPid = gun_open(Config),
 	Refs = [begin
@@ -388,12 +384,6 @@ parse_host(Config) ->
 		{response, nofin, 200, _} = gun:await(ConnPid, Ref),
 		{ok, Body} = gun:await_body(ConnPid, Ref)
 	end || {Host, Body} <- Tests],
-	ok.
-
-pipeline(Config) ->
-	ConnPid = gun_open(Config),
-	Refs = [gun:get(ConnPid, "/") || _ <- lists:seq(1, 5)],
-	_ = [{response, nofin, 200, _} = gun:await(ConnPid, Ref) || Ref <- Refs],
 	ok.
 
 rest_param_all(Config) ->
@@ -482,9 +472,15 @@ rest_keepalive(Config) ->
 rest_keepalive_post(Config) ->
 	ConnPid = gun_open(Config),
 	Refs = [begin
-		Ref1 = gun:post(ConnPid, "/forbidden_post", [{<<"content-type">>, <<"text/plain">>}]),
+		Ref1 = gun:post(ConnPid, "/forbidden_post", [
+			{<<"content-type">>, <<"text/plain">>},
+			{<<"content-length">>, <<"12">>}
+		]),
 		gun:data(ConnPid, Ref1, fin, "Hello world!"),
-		Ref2 = gun:post(ConnPid, "/simple_post", [{<<"content-type">>, <<"text/plain">>}]),
+		Ref2 = gun:post(ConnPid, "/simple_post", [
+			{<<"content-type">>, <<"text/plain">>},
+			{<<"content-length">>, <<"12">>}
+		]),
 		gun:data(ConnPid, Ref2, fin, "Hello world!"),
 		{Ref1, Ref2}
 	end || _ <- lists:seq(1, 5)],
@@ -568,8 +564,8 @@ rest_resource_etags(Config) ->
 		{200, <<"\"etag-header-value\"">>, "tuple-strong"},
 		{200, <<"W/\"etag-header-value\"">>, "binary-weak-quoted"},
 		{200, <<"\"etag-header-value\"">>, "binary-strong-quoted"},
-		{400, false, "binary-strong-unquoted"},
-		{400, false, "binary-weak-unquoted"}
+		{500, false, "binary-strong-unquoted"},
+		{500, false, "binary-weak-unquoted"}
 	],
 	_ = [{Status, ETag, Type} = begin
 		{Ret, RespETag} = rest_resource_get_etag(Config, Type),
@@ -598,6 +594,10 @@ set_env_dispatch(Config) ->
 	ConnPid2 = gun_open(Config),
 	Ref2 = gun:get(ConnPid2, "/"),
 	{response, nofin, 200, _} = gun:await(ConnPid2, Ref2),
+	ok.
+
+path_allow_colon(_Config) ->
+	cowboy_router:compile([{'_', [{"/foo/bar:blah", http_handler, []}]}]),
 	ok.
 
 set_resp_body(Config) ->

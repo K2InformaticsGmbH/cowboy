@@ -37,6 +37,8 @@
 	id = undefined :: cowboy_stream:streamid(),
 	%% Stream handlers and their state.
 	state = undefined :: {module(), any()} | flush,
+	%% Request method.
+	method = undefined :: binary(),
 	%% Whether we finished sending data.
 	local = idle :: idle | upgrade | cowboy_stream:fin() | flush,
 	%% Local flow control window (how much we can send).
@@ -46,6 +48,7 @@
 		{cowboy_stream:fin(), non_neg_integer(), iolist()
 			| {sendfile, non_neg_integer(), pos_integer(), file:name_all()}}),
 	local_buffer_size = 0 :: non_neg_integer(),
+	local_trailers = undefined :: undefined | cowboy:http_headers(),
 	%% Whether we finished receiving data.
 	remote = nofin :: cowboy_stream:fin(),
 	%% Remote flow control window (how much we accept to receive).
@@ -197,7 +200,7 @@ init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer, _Settings, 
 
 preface(#state{socket=Socket, transport=Transport, next_settings=Settings}) ->
 	%% We send next_settings and use defaults until we get a ack.
-	ok = Transport:send(Socket, cow_http2:settings(Settings)).
+	Transport:send(Socket, cow_http2:settings(Settings)).
 
 preface_timeout(Opts) ->
 	PrefaceTimeout = maps:get(preface_timeout, Opts, 5000),
@@ -273,7 +276,6 @@ parse(State=#state{socket=Socket, transport=Transport, parse_state={preface, seq
 			<< Preface:Len/binary, _/bits >> = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
 			case Data of
 				Preface ->
-					%% @todo OK we should have a timeout when waiting for the preface.
 					before_loop(State, Data);
 				_ ->
 					Transport:close(Socket),
@@ -294,6 +296,9 @@ parse(State=#state{local_settings=#{max_frame_size := MaxFrameSize},
 				{continuation, _, _, _} ->
 					parse(continuation_frame(State, Frame), Rest)
 			end;
+		{ignore, _} when element(1, ParseState) =:= continuation ->
+			terminate(State, {connection_error, protocol_error,
+				'An invalid frame was received in the middle of a header block. (RFC7540 6.2)'});
 		{ignore, Rest} ->
 			parse(State, Rest);
 		{stream_error, StreamID, Reason, Human, Rest} ->
@@ -359,9 +364,12 @@ frame(State, {headers, StreamID, _, _, _}) when StreamID rem 2 =:= 0 ->
 	terminate(State, {connection_error, protocol_error,
 		'HEADERS frame received with even-numbered streamid. (RFC7540 5.1.1)'});
 %% HEADERS frame received on (half-)closed stream.
+%%
+%% We always close the connection here to avoid having to decode
+%% the headers to not waste resources on non-compliant clients.
 frame(State=#state{client_streamid=LastStreamID}, {headers, StreamID, _, _, _})
 		when StreamID =< LastStreamID ->
-	stream_reset(State, StreamID, {stream_error, stream_closed,
+	terminate(State, {connection_error, stream_closed,
 		'HEADERS frame received on a stream in closed or half-closed state. (RFC7540 5.1)'});
 %% Single HEADERS frame headers block.
 frame(State, {headers, StreamID, IsFin, head_fin, HeaderBlock}) ->
@@ -393,10 +401,17 @@ frame(State=#state{client_streamid=LastStreamID}, {rst_stream, StreamID, _})
 frame(State, {rst_stream, StreamID, Reason}) ->
 	stream_terminate(State, StreamID, {stream_error, Reason, 'Stream reset requested by client.'});
 %% SETTINGS frame.
-frame(State=#state{socket=Socket, transport=Transport, remote_settings=Settings0},
+frame(State0=#state{socket=Socket, transport=Transport, remote_settings=Settings0},
 		{settings, Settings}) ->
 	Transport:send(Socket, cow_http2:settings_ack()),
-	State#state{remote_settings=maps:merge(Settings0, Settings)};
+	State = State0#state{remote_settings=maps:merge(Settings0, Settings)},
+	case Settings of
+		#{initial_window_size := NewWindowSize} ->
+			OldWindowSize = maps:get(initial_window_size, Settings0, 65535),
+			update_stream_windows(State, NewWindowSize - OldWindowSize);
+		_ ->
+			State
+	end;
 %% Ack for a previously sent SETTINGS frame.
 frame(State=#state{next_settings=_NextSettings}, settings_ack) ->
 	%% @todo Apply SETTINGS that require synchronization.
@@ -418,6 +433,10 @@ frame(State, {ping_ack, _Opaque}) ->
 frame(State, Frame={goaway, _, _, _}) ->
 	terminate(State, {stop, Frame, 'Client is going away.'});
 %% Connection-wide WINDOW_UPDATE frame.
+frame(State=#state{local_window=ConnWindow}, {window_update, Increment})
+		when ConnWindow + Increment > 16#7fffffff ->
+	terminate(State, {connection_error, flow_control_error,
+		'The flow control window must not be greater than 2^31-1. (RFC7540 6.9.1)'});
 frame(State=#state{local_window=ConnWindow}, {window_update, Increment}) ->
 	send_data(State#state{local_window=ConnWindow + Increment});
 %% Stream-specific WINDOW_UPDATE frame.
@@ -427,6 +446,9 @@ frame(State=#state{client_streamid=LastStreamID}, {window_update, StreamID, _})
 		'WINDOW_UPDATE frame received on a stream in idle state. (RFC7540 5.1)'});
 frame(State0=#state{streams=Streams0}, {window_update, StreamID, Increment}) ->
 	case lists:keyfind(StreamID, #stream.id, Streams0) of
+		#stream{local_window=StreamWindow} when StreamWindow + Increment > 16#7fffffff ->
+			stream_reset(State0, StreamID, {stream_error, flow_control_error,
+				'The flow control window must not be greater than 2^31-1. (RFC7540 6.9.1)'});
 		Stream0 = #stream{local_window=StreamWindow} ->
 			{State, Stream} = send_data(State0,
 				Stream0#stream{local_window=StreamWindow + Increment}),
@@ -453,7 +475,7 @@ continuation_frame(State=#state{parse_state={continuation, StreamID, IsFin, Head
 		<< HeaderBlockFragment0/binary, HeaderBlockFragment1/binary >>}};
 continuation_frame(State, _) ->
 	terminate(State, {connection_error, protocol_error,
-		'An invalid frame was received while expecting a CONTINUATION frame. (RFC7540 6.2)'}).
+		'An invalid frame was received in the middle of a header block. (RFC7540 6.2)'}).
 
 down(State=#state{children=Children0}, Pid, Msg) ->
 	case cowboy_children:down(Children0, Pid) of
@@ -469,7 +491,7 @@ down(State=#state{children=Children0}, Pid, Msg) ->
 			State
 	end.
 
-info(State=#state{streams=Streams}, StreamID, Msg) ->
+info(State=#state{client_streamid=LastStreamID, streams=Streams}, StreamID, Msg) ->
 	case lists:keyfind(StreamID, #stream.id, Streams) of
 		#stream{state=flush} ->
 			error_logger:error_msg("Received message ~p for terminated stream ~p.", [Msg, StreamID]),
@@ -485,8 +507,14 @@ info(State=#state{streams=Streams}, StreamID, Msg) ->
 				stream_reset(State, StreamID, {internal_error, {Class, Exception},
 					'Unhandled exception in cowboy_stream:info/3.'})
 			end;
+		false when StreamID =< LastStreamID ->
+			%% Streams that were reset by the client or streams that are
+			%% in the lingering state may still have Erlang messages going
+			%% around. In these cases we do not want to log anything.
+			State;
 		false ->
-			error_logger:error_msg("Received message ~p for unknown stream ~p.", [Msg, StreamID]),
+			error_logger:error_msg("Received message ~p for unknown stream ~p.",
+				[Msg, StreamID]),
 			State
 	end.
 
@@ -498,42 +526,28 @@ commands(State, Stream=#stream{local=idle}, [{error_response, StatusCode, Header
 commands(State, Stream, [{error_response, _, _, _}|Tail]) ->
 	commands(State, Stream, Tail);
 %% Send an informational response.
-commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID, local=idle}, [{inform, StatusCode, Headers0}|Tail]) ->
-	Headers = Headers0#{<<":status">> => status(StatusCode)},
-	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
-	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
-	commands(State#state{encode_state=EncodeState}, Stream, Tail);
+commands(State0, Stream=#stream{local=idle}, [{inform, StatusCode, Headers}|Tail]) ->
+	State = send_headers(State0, Stream, StatusCode, Headers, fin),
+	commands(State, Stream, Tail);
 %% Send response headers.
 %%
 %% @todo Kill the stream if it sent a response when one has already been sent.
 %% @todo Keep IsFin in the state.
 %% @todo Same two things above apply to DATA, possibly promise too.
-commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID, local=idle}, [{response, StatusCode, Headers0, Body}|Tail]) ->
-	Headers = Headers0#{<<":status">> => status(StatusCode)},
-	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
-	case Body of
-		<<>> ->
-			Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
-			commands(State#state{encode_state=EncodeState}, Stream#stream{local=fin}, Tail);
-		{sendfile, O, B, P} ->
-			Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-			commands(State#state{encode_state=EncodeState}, Stream#stream{local=nofin},
-				[{sendfile, fin, O, B, P}|Tail]);
-		_ ->
-			Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-			{State1, Stream1} = send_data(State, Stream#stream{local=nofin}, fin, Body),
-			commands(State1#state{encode_state=EncodeState}, Stream1, Tail)
-	end;
+commands(State0, Stream0=#stream{local=idle},
+		[{response, StatusCode, Headers, Body}|Tail]) ->
+	{State, Stream} = send_response(State0, Stream0, StatusCode, Headers, Body),
+	commands(State, Stream, Tail);
 %% @todo response when local!=idle
 %% Send response headers.
-commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID, local=idle}, [{headers, StatusCode, Headers0}|Tail]) ->
-	Headers = Headers0#{<<":status">> => status(StatusCode)},
-	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
-	Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-	commands(State#state{encode_state=EncodeState}, Stream#stream{local=nofin}, Tail);
+commands(State0, Stream=#stream{method=Method, local=idle},
+		[{headers, StatusCode, Headers}|Tail]) ->
+	IsFin = case Method of
+		<<"HEAD">> -> fin;
+		_ -> nofin
+	end,
+	State = send_headers(State0, Stream, StatusCode, Headers, IsFin),
+	commands(State, Stream#stream{local=IsFin}, Tail);
 %% @todo headers when local!=idle
 %% Send a response body chunk.
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
@@ -558,10 +572,11 @@ commands(State0, Stream0=#stream{local=nofin, te=TE0}, [{trailers, Trailers}|Tai
 	end,
 	commands(State, Stream, Tail);
 %% Send a file.
-commands(State0, Stream0=#stream{local=nofin},
-		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
-	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
-	commands(State, Stream, Tail);
+%% @todo Add the sendfile command.
+%commands(State0, Stream0=#stream{local=nofin},
+%		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
+%	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
+%	commands(State, Stream, Tail);
 %% @todo sendfile when local!=nofin
 %% Send a push promise.
 %%
@@ -575,10 +590,10 @@ commands(State0=#state{socket=Socket, transport=Transport, server_streamid=Promi
 		{<<"https">>, 443} -> Host;
 		_ -> iolist_to_binary([Host, $:, integer_to_binary(Port)])
 	end,
-	PathWithQs = case Qs of
+	PathWithQs = iolist_to_binary(case Qs of
 		<<>> -> Path;
 		_ -> [Path, $?, Qs]
-	end,
+	end),
 	%% We need to make sure the header value is binary before we can
 	%% pass it to stream_req_init, as it expects them to be flat.
 	Headers1 = maps:map(fun(_, V) -> iolist_to_binary(V) end, Headers0),
@@ -586,11 +601,16 @@ commands(State0=#state{socket=Socket, transport=Transport, server_streamid=Promi
 		<<":method">> => Method,
 		<<":scheme">> => Scheme,
 		<<":authority">> => Authority,
-		<<":path">> => iolist_to_binary(PathWithQs)},
+		<<":path">> => PathWithQs},
 	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
 	Transport:send(Socket, cow_http2:push_promise(StreamID, PromisedStreamID, HeaderBlock)),
 	State = stream_req_init(State0#state{server_streamid=PromisedStreamID + 2,
-		encode_state=EncodeState}, PromisedStreamID, fin, Headers),
+		encode_state=EncodeState}, PromisedStreamID, fin, Headers1, #{
+			method => Method,
+			scheme => Scheme,
+			authority => Authority,
+			path => PathWithQs
+		}),
 	commands(State, Stream, Tail);
 commands(State=#state{socket=Socket, transport=Transport, remote_window=ConnWindow},
 		Stream=#stream{id=StreamID, remote_window=StreamWindow},
@@ -630,6 +650,24 @@ after_commands(State=#state{streams=Streams0}, Stream=#stream{id=StreamID}) ->
 	Streams = lists:keystore(StreamID, #stream.id, Streams0, Stream),
 	State#state{streams=Streams}.
 
+send_response(State0, Stream=#stream{method=Method}, StatusCode, Headers0, Body) ->
+	if
+		Method =:= <<"HEAD">>; Body =:= <<>> ->
+			State = send_headers(State0, Stream, StatusCode, Headers0, fin),
+			{State, Stream#stream{local=fin}};
+		true ->
+			State = send_headers(State0, Stream, StatusCode, Headers0, nofin),
+			%% send_data works with both sendfile and iolists.
+			send_data(State, Stream#stream{local=nofin}, fin, Body)
+	end.
+
+send_headers(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+		#stream{id=StreamID}, StatusCode, Headers0, IsFin) ->
+	Headers = Headers0#{<<":status">> => status(StatusCode)},
+	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
+	Transport:send(Socket, cow_http2:headers(StreamID, IsFin, HeaderBlock)),
+	State#state{encode_state=EncodeState}.
+
 status(Status) when is_integer(Status) ->
 	integer_to_binary(Status);
 status(<< H, T, U, _/bits >>) when H >= $1, H =< $9, T >= $0, T =< $9, U >= $0, U =< $9 ->
@@ -640,6 +678,15 @@ status(<< H, T, U, _/bits >>) when H >= $1, H =< $9, T >= $0, T =< $9, U >= $0, 
 %% all streams and send what we can until either everything is
 %% sent or we run out of space in the window.
 send_data(State=#state{streams=Streams}) ->
+	resume_streams(State, Streams, []).
+
+%% When SETTINGS_INITIAL_WINDOW_SIZE changes we need to update
+%% the stream windows for all active streams and perhaps resume
+%% sending data.
+update_stream_windows(State=#state{streams=Streams0}, Increment) ->
+	Streams = [
+		S#stream{local_window=StreamWindow + Increment}
+	|| S=#stream{local_window=StreamWindow} <- Streams0],
 	resume_streams(State, Streams, []).
 
 resume_streams(State, [], Acc) ->
@@ -663,6 +710,9 @@ resume_streams(State0, [Stream0|Tail], Acc) ->
 			resume_streams(State1, Tail, [Stream|Acc])
 	end.
 
+send_data(State, Stream=#stream{local=Local, local_buffer_size=0, local_trailers=Trailers})
+		when (Trailers =/= undefined) andalso ((Local =:= idle) orelse (Local =:= nofin)) ->
+	send_trailers(State, Stream#stream{local_trailers=undefined}, Trailers);
 %% @todo We might want to print an error if local=fin.
 %%
 %% @todo It's possible that the stream terminates. We must remove it.
@@ -681,12 +731,12 @@ send_data(State0, Stream0=#stream{local_buffer=Q0, local_buffer_size=BufferSize}
 send_data(State, Stream, IsFin, Data) ->
 	send_data(State, Stream, IsFin, Data, in).
 
-%% Always send trailer frames even if the window is empty.
-send_data(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
-		Stream=#stream{id=StreamID}, fin, {trailers, Trailers}, _) ->
-	{HeaderBlock, EncodeState} = headers_encode(Trailers, EncodeState0),
-	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
-	{State#state{encode_state=EncodeState}, Stream#stream{local=fin}};
+%% We can send trailers immediately if the queue is empty, otherwise we queue.
+%% We always send trailer frames even if the window is empty.
+send_data(State, Stream=#stream{local_buffer_size=0}, fin, {trailers, Trailers}, _) ->
+	send_trailers(State, Stream, Trailers);
+send_data(State, Stream, fin, {trailers, Trailers}, _) ->
+	{State, Stream#stream{local_trailers=Trailers}};
 %% Send data immediately if we can, buffer otherwise.
 %% @todo We might want to print an error if local=fin.
 send_data(State=#state{local_window=ConnWindow},
@@ -725,6 +775,12 @@ send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWind
 			end
 	end.
 
+send_trailers(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+		Stream=#stream{id=StreamID}, Trailers) ->
+	{HeaderBlock, EncodeState} = headers_encode(Trailers, EncodeState0),
+	Transport:send(Socket, cow_http2:headers(StreamID, fin, HeaderBlock)),
+	{State#state{encode_state=EncodeState}, Stream#stream{local=fin}}.
+
 queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data, In) ->
 	DataSize = case Data of
 		{sendfile, _, Bytes, _} -> Bytes;
@@ -733,8 +789,20 @@ queue_data(Stream=#stream{local_buffer=Q0, local_buffer_size=Size0}, IsFin, Data
 	Q = queue:In({IsFin, DataSize, Data}, Q0),
 	Stream#stream{local_buffer=Q, local_buffer_size=Size0 + DataSize}.
 
+%% The set-cookie header is special; we can only send one cookie per header.
+headers_encode(Headers0=#{<<"set-cookie">> := SetCookies}, EncodeState) ->
+	Headers1 = maps:to_list(maps:remove(<<"set-cookie">>, Headers0)),
+	Headers = Headers1 ++ [{<<"set-cookie">>, Value} || Value <- SetCookies],
+	cow_hpack:encode(Headers, EncodeState);
+headers_encode(Headers0, EncodeState) ->
+	Headers = maps:to_list(Headers0),
+	cow_hpack:encode(Headers, EncodeState).
+
 -spec terminate(#state{}, _) -> no_return().
 terminate(undefined, Reason) ->
+	exit({shutdown, Reason});
+terminate(#state{socket=Socket, transport=Transport, parse_state={preface, _, _}}, Reason) ->
+	Transport:close(Socket),
 	exit({shutdown, Reason});
 terminate(#state{socket=Socket, transport=Transport, client_streamid=LastStreamID,
 		streams=Streams, children=Children}, Reason) ->
@@ -762,26 +830,106 @@ terminate_all_streams([#stream{id=StreamID, state=StreamState}|Tail], Reason) ->
 
 %% Stream functions.
 
-stream_decode_init(State=#state{socket=Socket, transport=Transport,
-		decode_state=DecodeState0}, StreamID, IsFin, HeaderBlock) ->
-	%% @todo Add clause for CONNECT requests (no scheme/path).
-	try headers_decode(HeaderBlock, DecodeState0) of
-		{Headers=#{<<":method">> := _, <<":scheme">> := _,
-				<<":authority">> := _, <<":path">> := _}, DecodeState} ->
-			stream_req_init(State#state{decode_state=DecodeState}, StreamID, IsFin, Headers);
-		{_, DecodeState} ->
-			Transport:send(Socket, cow_http2:rst_stream(StreamID, protocol_error)),
-			State#state{decode_state=DecodeState}
+stream_decode_init(State=#state{decode_state=DecodeState0}, StreamID, IsFin, HeaderBlock) ->
+	try cow_hpack:decode(HeaderBlock, DecodeState0) of
+		{Headers, DecodeState} ->
+			stream_pseudo_headers_init(State#state{decode_state=DecodeState},
+				StreamID, IsFin, Headers)
 	catch _:_ ->
 		terminate(State, {connection_error, compression_error,
 			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'})
 	end.
 
+stream_pseudo_headers_init(State, StreamID, IsFin, Headers0) ->
+	case pseudo_headers(Headers0, #{}) of
+		%% @todo Add clause for CONNECT requests (no scheme/path).
+		{ok, PseudoHeaders=#{method := <<"CONNECT">>}, _} ->
+			stream_early_error(State, StreamID, IsFin, 501, PseudoHeaders,
+				'The CONNECT method is currently not implemented. (RFC7231 4.3.6)');
+		{ok, PseudoHeaders=#{method := <<"TRACE">>}, _} ->
+			stream_early_error(State, StreamID, IsFin, 501, PseudoHeaders,
+				'The TRACE method is currently not implemented. (RFC7231 4.3.8)');
+		{ok, PseudoHeaders=#{method := _, scheme := _, authority := _, path := _}, Headers} ->
+			stream_regular_headers_init(State, StreamID, IsFin, Headers, PseudoHeaders);
+		{ok, _, _} ->
+			stream_malformed(State, StreamID,
+				'A required pseudo-header was not found. (RFC7540 8.1.2.3)');
+		{error, HumanReadable} ->
+			stream_malformed(State, StreamID, HumanReadable)
+	end.
+
+pseudo_headers([{<<":method">>, _}|_], #{method := _}) ->
+	{error, 'Multiple :method pseudo-headers were found. (RFC7540 8.1.2.3)'};
+pseudo_headers([{<<":method">>, Method}|Tail], PseudoHeaders) ->
+	pseudo_headers(Tail, PseudoHeaders#{method => Method});
+pseudo_headers([{<<":scheme">>, _}|_], #{scheme := _}) ->
+	{error, 'Multiple :scheme pseudo-headers were found. (RFC7540 8.1.2.3)'};
+pseudo_headers([{<<":scheme">>, Scheme}|Tail], PseudoHeaders) ->
+	pseudo_headers(Tail, PseudoHeaders#{scheme => Scheme});
+pseudo_headers([{<<":authority">>, _}|_], #{authority := _}) ->
+	{error, 'Multiple :authority pseudo-headers were found. (RFC7540 8.1.2.3)'};
+pseudo_headers([{<<":authority">>, Authority}|Tail], PseudoHeaders) ->
+	%% @todo Probably parse the authority here.
+	pseudo_headers(Tail, PseudoHeaders#{authority => Authority});
+pseudo_headers([{<<":path">>, _}|_], #{path := _}) ->
+	{error, 'Multiple :path pseudo-headers were found. (RFC7540 8.1.2.3)'};
+pseudo_headers([{<<":path">>, Path}|Tail], PseudoHeaders) ->
+	%% @todo Probably parse the path here.
+	pseudo_headers(Tail, PseudoHeaders#{path => Path});
+pseudo_headers([{<<":", _/bits>>, _}|_], _) ->
+	{error, 'An unknown or invalid pseudo-header was found. (RFC7540 8.1.2.1)'};
+pseudo_headers(Headers, PseudoHeaders) ->
+	{ok, PseudoHeaders, Headers}.
+
+stream_regular_headers_init(State, StreamID, IsFin, Headers, PseudoHeaders) ->
+	case regular_headers(Headers) of
+		ok ->
+			stream_req_init(State, StreamID, IsFin,
+				headers_to_map(Headers, #{}), PseudoHeaders);
+		{error, HumanReadable} ->
+			stream_malformed(State, StreamID, HumanReadable)
+	end.
+
+regular_headers([{<<":", _/bits>>, _}|_]) ->
+	{error, 'Pseudo-headers were found after regular headers. (RFC7540 8.1.2.1)'};
+regular_headers([{<<"connection">>, _}|_]) ->
+	{error, 'The connection header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"keep-alive">>, _}|_]) ->
+	{error, 'The keep-alive header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"proxy-authenticate">>, _}|_]) ->
+	{error, 'The proxy-authenticate header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"proxy-authorization">>, _}|_]) ->
+	{error, 'The proxy-authorization header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"transfer-encoding">>, _}|_]) ->
+	{error, 'The transfer-encoding header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"upgrade">>, _}|_]) ->
+	{error, 'The upgrade header is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{<<"te">>, Value}|_]) when Value =/= <<"trailers">> ->
+	{error, 'The te header with a value other than "trailers" is not allowed. (RFC7540 8.1.2.2)'};
+regular_headers([{Name, _}|Tail]) ->
+	case cowboy_bstr:to_lower(Name) of
+		Name -> regular_headers(Tail);
+		_ -> {error, 'Header names must be lowercase. (RFC7540 8.1.2)'}
+	end;
+regular_headers([]) ->
+	ok.
+
+%% This function is necessary to properly handle duplicate headers
+%% and the special-case cookie header.
+headers_to_map([], Acc) ->
+	Acc;
+headers_to_map([{Name, Value}|Tail], Acc0) ->
+	Acc = case Acc0 of
+		%% The cookie header does not use proper HTTP header lists.
+		#{Name := Value0} when Name =:= <<"cookie">> -> Acc0#{Name => << Value0/binary, "; ", Value/binary >>};
+		#{Name := Value0} -> Acc0#{Name => << Value0/binary, ", ", Value/binary >>};
+		_ -> Acc0#{Name => Value}
+	end,
+	headers_to_map(Tail, Acc).
+
 stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
-		StreamID, IsFin, Headers0=#{
-			<<":method">> := Method, <<":scheme">> := Scheme,
-			<<":authority">> := Authority, <<":path">> := PathWithQs}) ->
-	Headers = maps:without([<<":method">>, <<":scheme">>, <<":authority">>, <<":path">>], Headers0),
+		StreamID, IsFin, Headers, #{method := Method, scheme := Scheme,
+			authority := Authority, path := PathWithQs}) ->
 	BodyLength = case Headers of
 		_ when IsFin =:= fin ->
 			0;
@@ -797,38 +945,92 @@ stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
 		_ ->
 			undefined
 	end,
-	%% @todo If this fails to parse we want to gracefully handle the crash.
-	{Host, Port} = cow_http_hd:parse_host(Authority),
-	{Path, Qs} = cow_http:parse_fullpath(PathWithQs),
-	Req = #{
+	try cow_http_hd:parse_host(Authority) of
+		{Host, Port} ->
+			try cow_http:parse_fullpath(PathWithQs) of
+				{<<>>, _} ->
+					stream_malformed(State, StreamID,
+						'The path component must not be empty. (RFC7540 8.1.2.3)');
+				{Path, Qs} ->
+					Req = #{
+						ref => Ref,
+						pid => self(),
+						streamid => StreamID,
+						peer => Peer,
+						sock => Sock,
+						cert => Cert,
+						method => Method,
+						scheme => Scheme,
+						host => Host,
+						port => Port,
+						path => Path,
+						qs => Qs,
+						version => 'HTTP/2',
+						headers => Headers,
+						has_body => IsFin =:= nofin,
+						body_length => BodyLength
+					},
+					stream_handler_init(State, StreamID, IsFin, idle, Req)
+			catch _:_ ->
+				stream_malformed(State, StreamID,
+					'The :path pseudo-header is invalid. (RFC7540 8.1.2.3)')
+			end
+	catch _:_ ->
+		stream_malformed(State, StreamID,
+			'The :authority pseudo-header is invalid. (RFC7540 8.1.2.3)')
+	end.
+
+stream_malformed(State=#state{socket=Socket, transport=Transport}, StreamID, _) ->
+	Transport:send(Socket, cow_http2:rst_stream(StreamID, protocol_error)),
+	State.
+
+stream_early_error(State0=#state{ref=Ref, opts=Opts, peer=Peer,
+		local_settings=#{initial_window_size := RemoteWindow},
+		remote_settings=#{initial_window_size := LocalWindow},
+		streams=Streams}, StreamID, IsFin, StatusCode0,
+		#{method := Method}, HumanReadable) ->
+	%% We automatically terminate the stream but it is not an error
+	%% per se (at least not in the first implementation).
+	Reason = {stream_error, no_error, HumanReadable},
+	%% The partial Req is minimal for now. We only have one case
+	%% where it can be called (when a method is completely disabled).
+	PartialReq = #{
 		ref => Ref,
-		pid => self(),
-		streamid => StreamID,
 		peer => Peer,
-		sock => Sock,
-		cert => Cert,
-		method => Method,
-		scheme => Scheme,
-		host => Host,
-		port => Port,
-		path => Path,
-		qs => Qs,
-		version => 'HTTP/2',
-		headers => Headers,
-		has_body => IsFin =:= nofin,
-		body_length => BodyLength
+		method => Method
 	},
-	stream_handler_init(State, StreamID, IsFin, idle, Req).
+	Resp = {response, StatusCode0, RespHeaders0=#{<<"content-length">> => <<"0">>}, <<>>},
+	%% We need a stream to talk to the send_* functions.
+	Stream0 = #stream{id=StreamID, state=flush, method=Method,
+		remote=IsFin, local=idle,
+		local_window=LocalWindow, remote_window=RemoteWindow},
+	try cowboy_stream:early_error(StreamID, Reason, PartialReq, Resp, Opts) of
+		{response, StatusCode, RespHeaders, RespBody} ->
+			case send_response(State0, Stream0, StatusCode, RespHeaders, RespBody) of
+				{State, #stream{local=fin}} ->
+					State;
+				{State, Stream} ->
+					State#state{streams=[Stream|Streams]}
+			end
+	catch Class:Exception ->
+		cowboy_stream:report_error(early_error,
+			[StreamID, Reason, PartialReq, Resp, Opts],
+			Class, Exception, erlang:get_stacktrace()),
+		%% We still need to send an error response, so send what we initially
+		%% wanted to send. It's better than nothing.
+		send_headers(State0, Stream0, StatusCode0, RespHeaders0, fin)
+	end.
 
 stream_handler_init(State=#state{opts=Opts,
 		local_settings=#{initial_window_size := RemoteWindow},
 		remote_settings=#{initial_window_size := LocalWindow}},
-		StreamID, RemoteIsFin, LocalIsFin, Req=#{headers := Headers}) ->
+		StreamID, RemoteIsFin, LocalIsFin,
+		Req=#{method := Method, headers := Headers}) ->
 	try cowboy_stream:init(StreamID, Req, Opts) of
 		{Commands, StreamState} ->
 			commands(State#state{client_streamid=StreamID},
 				#stream{id=StreamID, state=StreamState,
-					remote=RemoteIsFin, local=LocalIsFin,
+					method=Method, remote=RemoteIsFin, local=LocalIsFin,
 					local_window=LocalWindow, remote_window=RemoteWindow,
 					te=maps:get(<<"te">>, Headers, undefined)},
 				Commands)
@@ -885,7 +1087,7 @@ stream_terminate(State0=#state{streams=Streams0, children=Children0}, StreamID, 
 			Children = cowboy_children:shutdown(Children0, StreamID),
 			State0#state{streams=[Stream#stream{state=flush, local=flush}|Streams],
 				children=Children};
-		%% Otherwise we sent an RST_STREAM and/or the stream is already closed.
+		%% Otherwise we sent or received an RST_STREAM and/or the stream is already closed.
 		{value, Stream=#stream{state=StreamState}, Streams} ->
 			State = maybe_skip_body(State0, Stream, Reason),
 			stream_call_terminate(StreamID, Reason, StreamState),
@@ -917,34 +1119,6 @@ stream_call_terminate(StreamID, Reason, StreamState) ->
 			[StreamID, Reason, StreamState],
 			Class, Exception, erlang:get_stacktrace())
 	end.
-
-%% Headers encode/decode.
-
-headers_decode(HeaderBlock, DecodeState0) ->
-	{Headers, DecodeState} = cow_hpack:decode(HeaderBlock, DecodeState0),
-	{headers_to_map(Headers, #{}), DecodeState}.
-
-%% This function is necessary to properly handle duplicate headers
-%% and the special-case cookie header.
-headers_to_map([], Acc) ->
-	Acc;
-headers_to_map([{Name, Value}|Tail], Acc0) ->
-	Acc = case Acc0 of
-		%% The cookie header does not use proper HTTP header lists.
-		#{Name := Value0} when Name =:= <<"cookie">> -> Acc0#{Name => << Value0/binary, "; ", Value/binary >>};
-		#{Name := Value0} -> Acc0#{Name => << Value0/binary, ", ", Value/binary >>};
-		_ -> Acc0#{Name => Value}
-	end,
-	headers_to_map(Tail, Acc).
-
-%% The set-cookie header is special; we can only send one cookie per header.
-headers_encode(Headers0=#{<<"set-cookie">> := SetCookies}, EncodeState) ->
-	Headers1 = maps:to_list(maps:remove(<<"set-cookie">>, Headers0)),
-	Headers = Headers1 ++ [{<<"set-cookie">>, Value} || Value <- SetCookies],
-	cow_hpack:encode(Headers, EncodeState);
-headers_encode(Headers0, EncodeState) ->
-	Headers = maps:to_list(Headers0),
-	cow_hpack:encode(Headers, EncodeState).
 
 %% System callbacks.
 

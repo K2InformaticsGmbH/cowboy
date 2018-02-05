@@ -94,10 +94,13 @@ do(<<"has_resp_body">>, Req0, Opts) ->
 			{ok, cowboy_req:reply(200, #{}, Req), Opts}
 	end;
 do(<<"delete_resp_header">>, Req0, Opts) ->
-	false = cowboy_req:has_resp_header(<<"content-type">>, Req0),
-	Req1 = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req0),
-	true = cowboy_req:has_resp_header(<<"content-type">>, Req1),
-	Req = cowboy_req:delete_resp_header(<<"content-type">>, Req1),
+	%% We try to delete first even though it hasn't been set to
+	%% make sure this noop is possible.
+	Req1 = cowboy_req:delete_resp_header(<<"content-type">>, Req0),
+	false = cowboy_req:has_resp_header(<<"content-type">>, Req1),
+	Req2 = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req1),
+	true = cowboy_req:has_resp_header(<<"content-type">>, Req2),
+	Req = cowboy_req:delete_resp_header(<<"content-type">>, Req2),
 	false = cowboy_req:has_resp_header(<<"content-type">>, Req),
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
 do(<<"inform2">>, Req0, Opts) ->
@@ -212,6 +215,15 @@ do(<<"stream_body">>, Req0, Opts) ->
 	end;
 do(<<"stream_trailers">>, Req0, Opts) ->
 	case cowboy_req:binding(arg, Req0) of
+		<<"large">> ->
+			Req = cowboy_req:stream_reply(200, #{
+				<<"trailer">> => <<"grpc-status">>
+			}, Req0),
+			cowboy_req:stream_body(<<0:800000>>, nofin, Req),
+			cowboy_req:stream_trailers(#{
+				<<"grpc-status">> => <<"0">>
+			}, Req),
+			{ok, Req, Opts};
 		_ ->
 			Req = cowboy_req:stream_reply(200, #{
 				<<"trailer">> => <<"grpc-status">>

@@ -90,6 +90,19 @@ the `early_error/5` callback must return a response command.
 
 The following commands are defined:
 
+[[inform_command]]
+=== inform
+
+Send an informational response to the client.
+
+[source,erlang]
+----
+{inform, cowboy:http_status(), cowboy:http_headers()}
+----
+
+Any number of informational responses may be sent,
+but only until the final response is sent.
+
 [[response_command]]
 === response
 
@@ -114,8 +127,8 @@ Initiate a response to the client.
 ----
 
 This initiates a response to the client. The stream
-will end when a data command with the `fin` flag is
-returned.
+will end when a data command with the `fin` flag or
+a trailer command is returned.
 
 [[data_command]]
 === data
@@ -125,6 +138,16 @@ Send data to the client.
 [source,erlang]
 ----
 {data, fin(), iodata()}
+----
+
+[[trailers_command]]
+=== trailers
+
+Send response trailers to the client.
+
+[source,erlang]
+----
+{trailers, cowboy:http_headers()}
 ----
 
 [[push_command]]
@@ -267,6 +290,15 @@ This is the raw exit message without any modification.
 // TODO receive the message, and perhaps *identify* which process
 // TODO gets it?
 
+=== inform
+
+Same as the xref:inform_command[inform command].
+
+Sent when the request process reads the body and an
+expect: 100-continue header was present in the request,
+or when the request process sends an informational
+response on its own.
+
 === response
 
 Same as the xref:response_command[response command].
@@ -285,6 +317,13 @@ Sent when the request process starts replying to the client.
 Same as the xref:data_command[data command].
 
 Sent when the request process streams data to the client.
+
+=== trailers
+
+Same as the xref:trailers_command[trailers command].
+
+Sent when the request process sends the trailer field values
+to the client.
 
 === push
 
@@ -394,6 +433,7 @@ tuple.
 
 == Changelog
 
+* *2.2*: The trailers command was introduced.
 * *2.0*: Module introduced.
 
 == See also

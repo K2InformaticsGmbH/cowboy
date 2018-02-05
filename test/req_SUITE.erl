@@ -14,6 +14,7 @@
 
 -module(req_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
@@ -854,14 +855,25 @@ stream_trailers(Config) ->
 	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),
 	ok.
 
+stream_trailers_large(Config) ->
+	doc("Stream large body followed by trailer headers."),
+	{200, RespHeaders, <<0:800000>>, [
+		{<<"grpc-status">>, <<"0">>}
+	]} = do_trailers("/resp/stream_trailers/large", Config),
+	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),
+	ok.
+
 stream_trailers_no_te(Config) ->
-	doc("Stream body followed by trailer headers."),
+	doc("Stream body followed by trailer headers without a te header in the request."),
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/resp/stream_trailers", [
 		{<<"accept-encoding">>, <<"gzip">>}
 	]),
 	{response, nofin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	%% @todo Do we want to remove the trailer header automatically?
+%	false = lists:keyfind(<<"trailer">>, 1, RespHeaders),
 	{ok, RespBody} = gun:await_body(ConnPid, Ref),
+	<<"Hello world!">> = do_decode(RespHeaders, RespBody),
 	gun:close(ConnPid).
 
 do_trailers(Path, Config) ->

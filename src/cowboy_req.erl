@@ -228,8 +228,10 @@ uri(#{scheme := Scheme0, host := Host0, port := Port0,
 	end,
 	Host = maps:get(host, Opts, Host0),
 	Port = maps:get(port, Opts, Port0),
-	Path = maps:get(path, Opts, Path0),
-	Qs = maps:get(qs, Opts, Qs0),
+	{Path, Qs} = case maps:get(path, Opts, Path0) of
+		<<"*">> -> {<<>>, <<>>};
+		P -> {P, maps:get(qs, Opts, Qs0)}
+	end,
 	Fragment = maps:get(fragment, Opts, undefined),
 	[uri_host(Scheme, Scheme0, Port, Host), uri_path(Path), uri_qs(Qs), uri_fragment(Fragment)].
 
@@ -686,7 +688,10 @@ has_resp_body(_) ->
 -spec delete_resp_header(binary(), Req)
 	-> Req when Req::req().
 delete_resp_header(Name, Req=#{resp_headers := RespHeaders}) ->
-	Req#{resp_headers => maps:remove(Name, RespHeaders)}.
+	Req#{resp_headers => maps:remove(Name, RespHeaders)};
+%% There are no resp headers so we have nothing to delete.
+delete_resp_header(_, Req) ->
+	Req.
 
 -spec inform(cowboy:http_status(), req()) -> ok.
 inform(Status, Req) ->
@@ -725,6 +730,11 @@ reply(Status, Headers, SendFile = {sendfile, _, Len, _}, Req)
 	do_reply(Status, Headers#{
 		<<"content-length">> => integer_to_binary(Len)
 	}, SendFile, Req);
+%% 204 responses must not include content-length. (RFC7230 3.3.1, RFC7230 3.3.2)
+reply(Status=204, Headers, Body, Req) ->
+	do_reply(Status, Headers, Body, Req);
+reply(Status= <<"204",_/bits>>, Headers, Body, Req) ->
+	do_reply(Status, Headers, Body, Req);
 reply(Status, Headers, Body, Req)
 		when is_integer(Status); is_binary(Status) ->
 	do_reply(Status, Headers#{

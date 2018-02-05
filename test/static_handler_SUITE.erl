@@ -14,6 +14,7 @@
 
 -module(static_handler_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
@@ -340,7 +341,7 @@ dir_dotdot_file(Config) ->
 
 dir_empty_file(Config) ->
 	doc("Get an empty .txt file."),
-	{200, Headers, <<>>} = do_get(config(prefix, Config) ++ "/empty.txt", Config),
+	{200, _, <<>>} = do_get(config(prefix, Config) ++ "/empty.txt", Config),
 	ok.
 
 dir_error_directory(Config) ->

@@ -82,6 +82,8 @@ compile_paths([{PathMatch, Fields, Handler, Opts}|Tail], Acc)
 		Fields, Handler, Opts}|Tail], Acc);
 compile_paths([{'_', Fields, Handler, Opts}|Tail], Acc) ->
 	compile_paths(Tail, [{'_', Fields, Handler, Opts}] ++ Acc);
+compile_paths([{<<"*">>, Fields, Handler, Opts}|Tail], Acc) ->
+	compile_paths(Tail, [{<<"*">>, Fields, Handler, Opts}|Acc]);
 compile_paths([{<< $/, PathMatch/bits >>, Fields, Handler, Opts}|Tail],
 		Acc) ->
 	PathRules = compile_rules(PathMatch, $/, [], [], <<>>),
@@ -99,12 +101,11 @@ compile_rules(<< S, Rest/bits >>, S, Segments, Rules, <<>>) ->
 	compile_rules(Rest, S, Segments, Rules, <<>>);
 compile_rules(<< S, Rest/bits >>, S, Segments, Rules, Acc) ->
 	compile_rules(Rest, S, [Acc|Segments], Rules, <<>>);
+%% Colon on path segment start is special, otherwise allow.
 compile_rules(<< $:, Rest/bits >>, S, Segments, Rules, <<>>) ->
 	{NameBin, Rest2} = compile_binding(Rest, S, <<>>),
 	Name = binary_to_atom(NameBin, utf8),
 	compile_rules(Rest2, S, Segments, Rules, Name);
-compile_rules(<< $:, _/bits >>, _, _, _, _) ->
-	error(badarg);
 compile_rules(<< $[, $., $., $., $], Rest/bits >>, S, Segments, Rules, Acc)
 		when Acc =:= <<>> ->
 	compile_rules(Rest, S, ['...'|Segments], Rules, Acc);
@@ -252,6 +253,8 @@ match_path([{'_', [], Handler, Opts}|_Tail], HostInfo, _, Bindings) ->
 	{ok, Handler, Opts, Bindings, HostInfo, undefined};
 match_path([{<<"*">>, _, Handler, Opts}|_Tail], HostInfo, <<"*">>, Bindings) ->
 	{ok, Handler, Opts, Bindings, HostInfo, undefined};
+match_path([_|Tail], HostInfo, <<"*">>, Bindings) ->
+	match_path(Tail, HostInfo, <<"*">>, Bindings);
 match_path([{PathMatch, Fields, Handler, Opts}|Tail], HostInfo, Tokens,
 		Bindings) when is_list(Tokens) ->
 	case list_match(Tokens, PathMatch, Bindings) of
