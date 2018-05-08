@@ -12,7 +12,7 @@
 %% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 %% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
--module(http_SUITE).
+-module(rfc7538_SUITE).
 -compile(export_all).
 -compile(nowarn_export_all).
 
@@ -20,30 +20,33 @@
 -import(ct_helper, [doc/1]).
 -import(cowboy_test, [gun_open/1]).
 
-all() -> [{group, clear}].
+all() ->
+	cowboy_test:common_all().
 
-groups() -> [{clear, [parallel], ct_helper:all(?MODULE)}].
+groups() ->
+	cowboy_test:common_groups(ct_helper:all(?MODULE)).
 
-init_routes(_) -> [
-	{"localhost", [
-		{"/", hello_h, []}
-	]}
-].
+init_per_group(Name, Config) ->
+	cowboy_test:init_common_groups(Name, Config, ?MODULE).
 
-switch_protocol_flush(Config) ->
-	doc("Confirm that switch_protocol does not flush unrelated messages."),
-	ProtoOpts = #{
-		env => #{dispatch => cowboy_router:compile(init_routes(Config))},
-		stream_handlers => [switch_protocol_flush_h]
-	},
-	{ok, _} = cowboy:start_clear(switch_protocol_flush, [{port, 0}], ProtoOpts),
-	Port = ranch:get_port(switch_protocol_flush),
-	Self = self(),
-	ConnPid = gun_open([{port, Port}, {type, tcp}, {protocol, http}|Config]),
-	_ = gun:get(ConnPid, "/", [
-		{<<"x-test-pid">>, pid_to_list(Self)}
+end_per_group(Name, _) ->
+	cowboy:stop_listener(Name).
+
+init_dispatch(_) ->
+	cowboy_router:compile([{"[...]", [
+		{"/resp/:key[/:arg]", resp_h, []}
+	]}]).
+
+status_code_308(Config) ->
+	doc("The 308 Permanent Redirect status code can be sent. (RFC7538 3)"),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/reply2/308", [
+		{<<"accept-encoding">>, <<"gzip">>}
 	]),
-	receive
-		{Self, Events} ->
-			switch_protocol_flush_h:validate(Events)
-	end.
+	{response, _, 308, _} = gun:await(ConnPid, Ref),
+	ok.
+
+%% @todo
+%   The server SHOULD generate a Location header field ([RFC7231],
+%   Section 7.1.2) in the response containing a preferred URI reference
+%   for the new permanent URI.

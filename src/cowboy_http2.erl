@@ -24,10 +24,19 @@
 
 -type opts() :: #{
 	connection_type => worker | supervisor,
+	enable_connect_protocol => boolean(),
 	env => cowboy_middleware:env(),
 	inactivity_timeout => timeout(),
+	initial_connection_window_size => 65535..16#7fffffff,
+	initial_stream_window_size => 0..16#7fffffff,
+	max_concurrent_streams => non_neg_integer() | infinity,
+	max_decode_table_size => non_neg_integer(),
+	max_encode_table_size => non_neg_integer(),
+	max_frame_size_received => 16384..16777215,
+	max_frame_size_sent => 16384..16777215 | infinity,
 	middlewares => [module()],
 	preface_timeout => timeout(),
+	settings_timeout => timeout(),
 	shutdown_timeout => timeout(),
 	stream_handlers => [module()]
 }.
@@ -53,6 +62,9 @@
 	remote = nofin :: cowboy_stream:fin(),
 	%% Remote flow control window (how much we accept to receive).
 	remote_window :: integer(),
+	%% Size expected and read from the request body.
+	remote_expected_size = undefined :: undefined | non_neg_integer(),
+	remote_read_size = 0 :: non_neg_integer(),
 	%% Unparsed te header. Used to know if we can send trailers.
 	te :: undefined | binary()
 }).
@@ -77,22 +89,16 @@
 
 	%% Settings are separate for each endpoint. In addition, settings
 	%% must be acknowledged before they can be expected to be applied.
-	%%
-	%% @todo Since the ack is required, we must timeout if we don't receive it.
-	%% @todo I haven't put as much thought as I should have on this,
-	%% the final settings handling will be very different.
 	local_settings = #{
 %		header_table_size => 4096,
-%		enable_push => false, %% We are the server. Push is never enabled.
+%		enable_push => false, %% We are the server. Push is never enabled for clients.
 %		max_concurrent_streams => infinity,
 		initial_window_size => 65535,
 		max_frame_size => 16384
 %		max_header_list_size => infinity
 	} :: map(),
-	%% @todo We need a TimerRef to do SETTINGS_TIMEOUT errors.
-	%% We need to be careful there. It's well possible that we send
-	%% two SETTINGS frames before we receive a SETTINGS ack.
-	next_settings = #{} :: undefined | map(), %% @todo perhaps set to undefined by default
+	next_settings = undefined :: undefined | map(),
+	next_settings_timer = undefined :: undefined | reference(),
 	remote_settings = #{
 		initial_window_size => 65535
 	} :: map(),
@@ -109,9 +115,15 @@
 	%% by the client or by the server through PUSH_PROMISE frames.
 	streams = [] :: [stream()],
 
-	%% HTTP/2 streams that have been reset recently. We are expected
-	%% to keep receiving additional frames after sending an RST_STREAM.
+	%% HTTP/2 streams that have been reset recently by the server.
+	%% We are expected to keep receiving additional frames after
+	%% sending an RST_STREAM.
 	lingering_streams = [] :: [cowboy_stream:streamid()],
+
+	%% HTTP/2 streams that have been reset recently by the client.
+	%% We keep a few of these around in order to reject subsequent
+	%% frames on these streams.
+	rst_lingering_streams = [] :: [cowboy_stream:streamid()],
 
 	%% Streams can spawn zero or more children which are then managed
 	%% by this module if operating as a supervisor.
@@ -122,7 +134,7 @@
 	%% is established and continues normally. An exception is when a HEADERS
 	%% frame is sent followed by CONTINUATION frames: no other frame can be
 	%% sent in between.
-	parse_state = undefined :: {preface, sequence, reference()}
+	parse_state = undefined :: {preface, sequence, undefined | reference()}
 		| {preface, settings, reference()}
 		| normal
 		| {continuation, cowboy_stream:streamid(), cowboy_stream:fin(), binary()},
@@ -165,9 +177,11 @@ init(Parent, Ref, Socket, Transport, Opts) ->
 	{inet:ip_address(), inet:port_number()}, {inet:ip_address(), inet:port_number()},
 	binary() | undefined, binary()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer) ->
-	State = #state{parent=Parent, ref=Ref, socket=Socket,
+	State0 = #state{parent=Parent, ref=Ref, socket=Socket,
 		transport=Transport, opts=Opts, peer=Peer, sock=Sock, cert=Cert,
+		remote_window=maps:get(initial_connection_window_size, Opts, 65535),
 		parse_state={preface, sequence, preface_timeout(Opts)}},
+	State = settings_init(State0, Opts),
 	preface(State),
 	case Buffer of
 		<<>> -> before_loop(State, Buffer);
@@ -181,6 +195,7 @@ init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer) ->
 init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer, _Settings, Req) ->
 	State0 = #state{parent=Parent, ref=Ref, socket=Socket,
 		transport=Transport, opts=Opts, peer=Peer, sock=Sock, cert=Cert,
+		remote_window=maps:get(initial_connection_window_size, Opts, 65535),
 		parse_state={preface, sequence, preface_timeout(Opts)}},
 	%% @todo Apply settings.
 	%% StreamID from HTTP/1.1 Upgrade requests is always 1.
@@ -188,30 +203,67 @@ init(Parent, Ref, Socket, Transport, Opts, Peer, Sock, Cert, Buffer, _Settings, 
 	State1 = stream_handler_init(State0, 1, fin, upgrade, Req),
 	%% We assume that the upgrade will be applied. A stream handler
 	%% must not prevent the normal operations of the server.
-	State = info(State1, 1, {switch_protocol, #{
+	State2 = info(State1, 1, {switch_protocol, #{
 		<<"connection">> => <<"Upgrade">>,
 		<<"upgrade">> => <<"h2c">>
 	}, ?MODULE, undefined}), %% @todo undefined or #{}?
+	State = settings_init(State2, Opts),
 	preface(State),
 	case Buffer of
 		<<>> -> before_loop(State, Buffer);
 		_ -> parse(State, Buffer)
 	end.
 
-preface(#state{socket=Socket, transport=Transport, next_settings=Settings}) ->
-	%% We send next_settings and use defaults until we get a ack.
-	Transport:send(Socket, cow_http2:settings(Settings)).
+settings_init(State, Opts) ->
+	S0 = setting_from_opt(#{}, Opts, max_decode_table_size,
+		header_table_size, 4096),
+	S1 = setting_from_opt(S0, Opts, max_concurrent_streams,
+		max_concurrent_streams, infinity),
+	S2 = setting_from_opt(S1, Opts, initial_stream_window_size,
+		initial_window_size, 65535),
+	S3 = setting_from_opt(S2, Opts, max_frame_size_received,
+		max_frame_size, 16384),
+	%% @todo max_header_list_size
+	Settings = setting_from_opt(S3, Opts, enable_connect_protocol,
+		enable_connect_protocol, false),
+	%% Start a timer if necessary. The timer will trigger only
+	%% if no SETTINGS ack was received in time.
+	TRef = case maps:get(settings_timeout, Opts, 5000) of
+		infinity -> undefined;
+		SettingsTimeout -> erlang:start_timer(SettingsTimeout, self(), settings_timeout)
+	end,
+	State#state{next_settings=Settings, next_settings_timer=TRef}.
+
+setting_from_opt(Settings, Opts, OptName, SettingName, Default) ->
+	case maps:get(OptName, Opts, Default) of
+		Default -> Settings;
+		Value -> Settings#{SettingName => Value}
+	end.
+
+%% We send next_settings and use defaults until we get an ack.
+%%
+%% We also send a WINDOW_UPDATE frame for the connection when
+%% the user specified an initial_connection_window_size.
+preface(#state{socket=Socket, transport=Transport, opts=Opts, next_settings=Settings}) ->
+	MaybeWindowUpdate = case maps:get(initial_connection_window_size, Opts, 65535) of
+		65535 -> <<>>;
+		Size -> cow_http2:window_update(Size - 65535)
+	end,
+	Transport:send(Socket, [cow_http2:settings(Settings), MaybeWindowUpdate]).
 
 preface_timeout(Opts) ->
-	PrefaceTimeout = maps:get(preface_timeout, Opts, 5000),
-	erlang:start_timer(PrefaceTimeout, self(), preface_timeout).
+	case maps:get(preface_timeout, Opts, 5000) of
+		infinity -> undefined;
+		PrefaceTimeout -> erlang:start_timer(PrefaceTimeout, self(), preface_timeout)
+	end.
 
 %% @todo Add the timeout for last time since we heard of connection.
 before_loop(State, Buffer) ->
 	loop(State, Buffer).
 
 loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
-		opts=Opts, children=Children, parse_state=PS}, Buffer) ->
+		opts=Opts, children=Children, next_settings_timer=SettingsTRef,
+		parse_state=PS}, Buffer) ->
 	Transport:setopts(Socket, [{active, once}]),
 	{OK, Closed, Error} = Transport:messages(),
 	InactivityTimeout = maps:get(inactivity_timeout, Opts, 300000),
@@ -225,6 +277,7 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 			terminate(State, {socket_error, Reason, 'An error has occurred on the socket.'});
 		%% System messages.
 		{'EXIT', Parent, Reason} ->
+			%% @todo We should exit gracefully.
 			exit(Reason);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [], {State, Buffer});
@@ -240,6 +293,9 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 				_ ->
 					loop(State, Buffer)
 			end;
+		{timeout, SettingsTRef, settings_timeout} ->
+			terminate(State, {connection_error, settings_timeout,
+				'The SETTINGS ack was not received within the configured time. (RFC7540 6.5.3)'});
 		%% Messages pertaining to a stream.
 		{{Pid, StreamID}, Msg} when Pid =:= self() ->
 			loop(info(State, StreamID, Msg), Buffer);
@@ -247,14 +303,8 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 		Msg = {'EXIT', Pid, _} ->
 			loop(down(State, Pid, Msg), Buffer);
 		%% Calls from supervisor module.
-		{'$gen_call', {From, Tag}, which_children} ->
-			From ! {Tag, cowboy_children:which_children(Children, ?MODULE)},
-			loop(State, Buffer);
-		{'$gen_call', {From, Tag}, count_children} ->
-			From ! {Tag, cowboy_children:count_children(Children)},
-			loop(State, Buffer);
-		{'$gen_call', {From, Tag}, _} ->
-			From ! {Tag, {error, ?MODULE}},
+		{'$gen_call', From, Call} ->
+			cowboy_children:handle_supervisor_call(Call, From, Children, ?MODULE),
 			loop(State, Buffer);
 		Msg ->
 			error_logger:error_msg("Received stray message ~p.", [Msg]),
@@ -310,7 +360,10 @@ parse(State=#state{local_settings=#{max_frame_size := MaxFrameSize},
 	end.
 
 parse_settings_preface(State, Frame={settings, _}, Rest, TRef) ->
-	_ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+	ok = case TRef of
+		undefined -> ok;
+		_ -> erlang:cancel_timer(TRef, [{async, true}, {info, false}])
+	end,
 	parse(frame(State#state{parse_state=normal}, Frame), Rest);
 parse_settings_preface(State, _, _, _) ->
 	terminate(State, {connection_error, protocol_error,
@@ -324,25 +377,20 @@ frame(State=#state{client_streamid=LastStreamID}, {data, StreamID, _, _})
 		when StreamID > LastStreamID ->
 	terminate(State, {connection_error, protocol_error,
 		'DATA frame received on a stream in idle state. (RFC7540 5.1)'});
+frame(State=#state{remote_window=ConnWindow}, {data, _, _, Data})
+		when byte_size(Data) > ConnWindow ->
+	terminate(State, {connection_error, flow_control_error,
+		'DATA frame overflowed the connection flow control window. (RFC7540 6.9, RFC7540 6.9.1)'});
 frame(State0=#state{remote_window=ConnWindow, streams=Streams, lingering_streams=Lingering},
 		{data, StreamID, IsFin, Data}) ->
 	DataLen = byte_size(Data),
 	State = State0#state{remote_window=ConnWindow - DataLen},
 	case lists:keyfind(StreamID, #stream.id, Streams) of
-		Stream = #stream{state=flush, remote=nofin, remote_window=StreamWindow} ->
-			after_commands(State, Stream#stream{remote=IsFin, remote_window=StreamWindow - DataLen});
-		Stream = #stream{state=StreamState0, remote=nofin, remote_window=StreamWindow} ->
-			try cowboy_stream:data(StreamID, IsFin, Data, StreamState0) of
-				{Commands, StreamState} ->
-					commands(State, Stream#stream{state=StreamState, remote=IsFin,
-						remote_window=StreamWindow - DataLen}, Commands)
-			catch Class:Exception ->
-				cowboy_stream:report_error(data,
-					[StreamID, IsFin, Data, StreamState0],
-					Class, Exception, erlang:get_stacktrace()),
-				stream_reset(State, StreamID, {internal_error, {Class, Exception},
-					'Unhandled exception in cowboy_stream:data/4.'})
-			end;
+		#stream{remote_window=StreamWindow} when StreamWindow < DataLen ->
+			stream_reset(State, StreamID, {stream_error, flow_control_error,
+				'DATA frame overflowed the stream flow control window. (RFC7540 6.9, RFC7540 6.9.1)'});
+		Stream = #stream{remote=nofin} ->
+			data_frame(State, Stream, IsFin, DataLen, Data);
 		#stream{remote=fin} ->
 			stream_reset(State, StreamID, {stream_error, stream_closed,
 				'DATA frame received for a half-closed (remote) stream. (RFC7540 5.1)'});
@@ -363,17 +411,30 @@ frame(State0=#state{remote_window=ConnWindow, streams=Streams, lingering_streams
 frame(State, {headers, StreamID, _, _, _}) when StreamID rem 2 =:= 0 ->
 	terminate(State, {connection_error, protocol_error,
 		'HEADERS frame received with even-numbered streamid. (RFC7540 5.1.1)'});
-%% HEADERS frame received on (half-)closed stream.
-%%
-%% We always close the connection here to avoid having to decode
-%% the headers to not waste resources on non-compliant clients.
-frame(State=#state{client_streamid=LastStreamID}, {headers, StreamID, _, _, _})
+%% Either a HEADERS frame received on (half-)closed stream,
+%% or a HEADERS frame containing the trailers.
+frame(State=#state{client_streamid=LastStreamID, streams=Streams},
+		{headers, StreamID, IsFin, IsHeadFin, HeaderBlockOrFragment})
 		when StreamID =< LastStreamID ->
-	terminate(State, {connection_error, stream_closed,
-		'HEADERS frame received on a stream in closed or half-closed state. (RFC7540 5.1)'});
+	case lists:keyfind(StreamID, #stream.id, Streams) of
+		Stream = #stream{remote=nofin} when IsFin =:= fin ->
+			case IsHeadFin of
+				head_fin ->
+					stream_decode_trailers(State, Stream, HeaderBlockOrFragment);
+				head_nofin ->
+					State#state{parse_state={continuation, StreamID, IsFin, HeaderBlockOrFragment}}
+			end;
+		%% We always close the connection here to avoid having to decode
+		%% the headers to not waste resources on non-compliant clients.
+		#stream{remote=nofin} when IsFin =:= nofin ->
+			terminate(State, {connection_error, protocol_error,
+				'Trailing HEADERS frame received without the END_STREAM flag set. (RFC7540 8.1, RFC7540 8.1.2.6)'});
+		_ ->
+			terminate(State, {connection_error, stream_closed,
+				'HEADERS frame received on a stream in closed or half-closed state. (RFC7540 5.1)'})
+	end;
 %% Single HEADERS frame headers block.
 frame(State, {headers, StreamID, IsFin, head_fin, HeaderBlock}) ->
-	%% @todo We probably need to validate StreamID here and in 4 next clauses.
 	stream_decode_init(State, StreamID, IsFin, HeaderBlock);
 %% HEADERS frame starting a headers block. Enter continuation mode.
 frame(State, {headers, StreamID, IsFin, head_nofin, HeaderBlockFragment}) ->
@@ -390,7 +451,6 @@ frame(State, {headers, StreamID, IsFin, head_nofin,
 	State#state{parse_state={continuation, StreamID, IsFin, HeaderBlockFragment}};
 %% PRIORITY frame.
 frame(State, {priority, _StreamID, _IsExclusive, _DepStreamID, _Weight}) ->
-	%% @todo Validate StreamID?
 	%% @todo Handle priority.
 	State;
 %% RST_STREAM frame.
@@ -399,23 +459,41 @@ frame(State=#state{client_streamid=LastStreamID}, {rst_stream, StreamID, _})
 	terminate(State, {connection_error, protocol_error,
 		'RST_STREAM frame received on a stream in idle state. (RFC7540 5.1)'});
 frame(State, {rst_stream, StreamID, Reason}) ->
-	stream_terminate(State, StreamID, {stream_error, Reason, 'Stream reset requested by client.'});
+	stream_terminate(stream_rst_linger(State, StreamID), StreamID,
+		{stream_error, Reason, 'Stream reset requested by client.'});
 %% SETTINGS frame.
-frame(State0=#state{socket=Socket, transport=Transport, remote_settings=Settings0},
-		{settings, Settings}) ->
+frame(State0=#state{socket=Socket, transport=Transport, opts=Opts,
+		remote_settings=Settings0}, {settings, Settings}) ->
 	Transport:send(Socket, cow_http2:settings_ack()),
-	State = State0#state{remote_settings=maps:merge(Settings0, Settings)},
-	case Settings of
-		#{initial_window_size := NewWindowSize} ->
+	State1 = State0#state{remote_settings=maps:merge(Settings0, Settings)},
+	maps:fold(fun
+		(header_table_size, NewSize, State=#state{encode_state=EncodeState0}) ->
+			MaxSize = maps:get(max_encode_table_size, Opts, 4096),
+			EncodeState = cow_hpack:set_max_size(min(NewSize, MaxSize), EncodeState0),
+			State#state{encode_state=EncodeState};
+		(initial_window_size, NewWindowSize, State) ->
 			OldWindowSize = maps:get(initial_window_size, Settings0, 65535),
-			update_stream_windows(State, NewWindowSize - OldWindowSize);
-		_ ->
+			update_streams_local_window(State, NewWindowSize - OldWindowSize);
+		(_, _, State) ->
 			State
-	end;
+	end, State1, Settings);
 %% Ack for a previously sent SETTINGS frame.
-frame(State=#state{next_settings=_NextSettings}, settings_ack) ->
-	%% @todo Apply SETTINGS that require synchronization.
-	State;
+frame(State0=#state{local_settings=Local0, next_settings=NextSettings,
+		next_settings_timer=TRef}, settings_ack) ->
+	ok = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+	Local = maps:merge(Local0, NextSettings),
+	State1 = State0#state{local_settings=Local, next_settings=#{},
+		next_settings_timer=undefined},
+	maps:fold(fun
+		(header_table_size, MaxSize, State=#state{decode_state=DecodeState0}) ->
+			DecodeState = cow_hpack:set_max_size(MaxSize, DecodeState0),
+			State#state{decode_state=DecodeState};
+		(initial_window_size, NewWindowSize, State) ->
+			OldWindowSize = maps:get(initial_window_size, Local0, 65535),
+			update_streams_remote_window(State, NewWindowSize - OldWindowSize);
+		(_, _, State) ->
+			State
+	end, State1, NextSettings);
 %% Unexpected PUSH_PROMISE frame.
 frame(State, {push_promise, _, _, _, _}) ->
 	terminate(State, {connection_error, protocol_error,
@@ -444,7 +522,8 @@ frame(State=#state{client_streamid=LastStreamID}, {window_update, StreamID, _})
 		when StreamID > LastStreamID ->
 	terminate(State, {connection_error, protocol_error,
 		'WINDOW_UPDATE frame received on a stream in idle state. (RFC7540 5.1)'});
-frame(State0=#state{streams=Streams0}, {window_update, StreamID, Increment}) ->
+frame(State0=#state{streams=Streams0, rst_lingering_streams=RstLingering},
+		{window_update, StreamID, Increment}) ->
 	case lists:keyfind(StreamID, #stream.id, Streams0) of
 		#stream{local_window=StreamWindow} when StreamWindow + Increment > 16#7fffffff ->
 			stream_reset(State0, StreamID, {stream_error, flow_control_error,
@@ -454,21 +533,75 @@ frame(State0=#state{streams=Streams0}, {window_update, StreamID, Increment}) ->
 				Stream0#stream{local_window=StreamWindow + Increment}),
 			Streams = lists:keystore(StreamID, #stream.id, Streams0, Stream),
 			State#state{streams=Streams};
-		%% @todo We must reject WINDOW_UPDATE frames on RST_STREAM closed streams.
 		false ->
 			%% WINDOW_UPDATE frames may be received for a short period of time
 			%% after a stream is closed. They must be ignored.
-			State0
+			case lists:member(StreamID, RstLingering) of
+				false -> State0;
+				true -> stream_closed(State0, StreamID, {stream_error, stream_closed,
+					'WINDOW_UPDATE frame received after the stream was reset. (RFC7540 5.1)'})
+			end
 	end;
 %% Unexpected CONTINUATION frame.
 frame(State, {continuation, _, _, _}) ->
 	terminate(State, {connection_error, protocol_error,
 		'CONTINUATION frames MUST be preceded by a HEADERS frame. (RFC7540 6.10)'}).
 
-continuation_frame(State=#state{parse_state={continuation, StreamID, IsFin, HeaderBlockFragment0}},
+data_frame(State, Stream0=#stream{id=StreamID, remote_window=StreamWindow,
+		remote_read_size=StreamRead}, IsFin, DataLen, Data) ->
+	Stream = Stream0#stream{remote=IsFin,
+		remote_window=StreamWindow - DataLen,
+		remote_read_size=StreamRead + DataLen},
+	case is_body_size_valid(Stream) of
+		true ->
+			data_frame(State, Stream, IsFin, Data);
+		false ->
+			stream_reset(after_commands(State, Stream), StreamID, {stream_error, protocol_error,
+				'The total size of DATA frames is different than the content-length. (RFC7540 8.1.2.6)'})
+	end.
+
+%% We ignore DATA frames for streams that are flushing out data.
+data_frame(State, Stream=#stream{state=flush}, _, _) ->
+	after_commands(State, Stream);
+data_frame(State, Stream=#stream{id=StreamID, state=StreamState0}, IsFin, Data) ->
+	try cowboy_stream:data(StreamID, IsFin, Data, StreamState0) of
+		{Commands, StreamState} ->
+			commands(State, Stream#stream{state=StreamState}, Commands)
+	catch Class:Exception ->
+		cowboy_stream:report_error(data,
+			[StreamID, IsFin, Data, StreamState0],
+			Class, Exception, erlang:get_stacktrace()),
+		stream_reset(State, StreamID, {internal_error, {Class, Exception},
+			'Unhandled exception in cowboy_stream:data/4.'})
+	end.
+
+%% It's always valid when no content-length header was specified.
+is_body_size_valid(#stream{remote_expected_size=undefined}) ->
+	true;
+%% We didn't finish reading the body but the size is already larger than expected.
+is_body_size_valid(#stream{remote=nofin, remote_expected_size=Expected,
+		remote_read_size=Read}) when Read > Expected ->
+	false;
+is_body_size_valid(#stream{remote=nofin}) ->
+	true;
+is_body_size_valid(#stream{remote=fin, remote_expected_size=Expected,
+		remote_read_size=Expected}) ->
+	true;
+%% We finished reading the body and the size read is not the one expected.
+is_body_size_valid(_) ->
+	false.
+
+continuation_frame(State=#state{client_streamid=LastStreamID, streams=Streams,
+		parse_state={continuation, StreamID, IsFin, HeaderBlockFragment0}},
 		{continuation, StreamID, head_fin, HeaderBlockFragment1}) ->
-	stream_decode_init(State#state{parse_state=normal}, StreamID, IsFin,
-		<< HeaderBlockFragment0/binary, HeaderBlockFragment1/binary >>);
+	HeaderBlock = << HeaderBlockFragment0/binary, HeaderBlockFragment1/binary >>,
+	case StreamID > LastStreamID of
+		true -> %% New stream.
+			stream_decode_init(State#state{parse_state=normal}, StreamID, IsFin, HeaderBlock);
+		false -> %% Trailers.
+			Stream = lists:keyfind(StreamID, #stream.id, Streams),
+			stream_decode_trailers(State, Stream, HeaderBlock)
+	end;
 continuation_frame(State=#state{parse_state={continuation, StreamID, IsFin, HeaderBlockFragment0}},
 		{continuation, StreamID, head_nofin, HeaderBlockFragment1}) ->
 	State#state{parse_state={continuation, StreamID, IsFin,
@@ -518,6 +651,9 @@ info(State=#state{client_streamid=LastStreamID, streams=Streams}, StreamID, Msg)
 			State
 	end.
 
+%% @todo Kill the stream if it tries to send a response, headers,
+%% data or push promise when the stream is closed or half-closed.
+
 commands(State, Stream, []) ->
 	after_commands(State, Stream);
 %% Error responses are sent only if a response wasn't sent already.
@@ -527,18 +663,13 @@ commands(State, Stream, [{error_response, _, _, _}|Tail]) ->
 	commands(State, Stream, Tail);
 %% Send an informational response.
 commands(State0, Stream=#stream{local=idle}, [{inform, StatusCode, Headers}|Tail]) ->
-	State = send_headers(State0, Stream, StatusCode, Headers, fin),
+	State = send_headers(State0, Stream, StatusCode, Headers, nofin),
 	commands(State, Stream, Tail);
 %% Send response headers.
-%%
-%% @todo Kill the stream if it sent a response when one has already been sent.
-%% @todo Keep IsFin in the state.
-%% @todo Same two things above apply to DATA, possibly promise too.
 commands(State0, Stream0=#stream{local=idle},
 		[{response, StatusCode, Headers, Body}|Tail]) ->
 	{State, Stream} = send_response(State0, Stream0, StatusCode, Headers, Body),
 	commands(State, Stream, Tail);
-%% @todo response when local!=idle
 %% Send response headers.
 commands(State0, Stream=#stream{method=Method, local=idle},
 		[{headers, StatusCode, Headers}|Tail]) ->
@@ -548,12 +679,10 @@ commands(State0, Stream=#stream{method=Method, local=idle},
 	end,
 	State = send_headers(State0, Stream, StatusCode, Headers, IsFin),
 	commands(State, Stream#stream{local=IsFin}, Tail);
-%% @todo headers when local!=idle
 %% Send a response body chunk.
 commands(State0, Stream0=#stream{local=nofin}, [{data, IsFin, Data}|Tail]) ->
 	{State, Stream} = send_data(State0, Stream0, IsFin, Data),
 	commands(State, Stream, Tail);
-%% @todo data when local!=nofin
 %% Send trailers.
 commands(State0, Stream0=#stream{local=nofin, te=TE0}, [{trailers, Trailers}|Tail]) ->
 	%% We only accept TE headers containing exactly "trailers" (RFC7540 8.1.2.1).
@@ -577,7 +706,6 @@ commands(State0, Stream0=#stream{local=nofin, te=TE0}, [{trailers, Trailers}|Tai
 %		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
 %	{State, Stream} = send_data(State0, Stream0, IsFin, {sendfile, Offset, Bytes, Path}),
 %	commands(State, Stream, Tail);
-%% @todo sendfile when local!=nofin
 %% Send a push promise.
 %%
 %% @todo We need to keep track of what promises we made so that we don't
@@ -637,9 +765,11 @@ commands(State=#state{socket=Socket, transport=Transport},
 		Stream=#stream{local=upgrade}, [{switch_protocol, Headers, ?MODULE, _}|Tail]) ->
 	Transport:send(Socket, cow_http:response(101, 'HTTP/1.1', maps:to_list(Headers))),
 	commands(State, Stream#stream{local=idle}, Tail);
-%% HTTP/2 has no support for the Upgrade mechanism.
-commands(State, Stream, [{switch_protocol, _Headers, _Mod, _ModState}|Tail]) ->
-	%% @todo This is an error. Not sure what to do here yet.
+%% Use a different protocol within the stream (CONNECT :protocol).
+%% @todo Make sure we error out when the feature is disabled.
+commands(State0, #stream{id=StreamID}, [{switch_protocol, Headers, _Mod, _ModState}|Tail]) ->
+	State = #state{streams=Streams} = info(State0, StreamID, {headers, 200, Headers}),
+	Stream = lists:keyfind(StreamID, #stream.id, Streams),
 	commands(State, Stream, Tail);
 commands(State, Stream=#stream{id=StreamID}, [stop|_Tail]) ->
 	%% @todo Do we want to run the commands after a stop?
@@ -681,13 +811,21 @@ send_data(State=#state{streams=Streams}) ->
 	resume_streams(State, Streams, []).
 
 %% When SETTINGS_INITIAL_WINDOW_SIZE changes we need to update
-%% the stream windows for all active streams and perhaps resume
-%% sending data.
-update_stream_windows(State=#state{streams=Streams0}, Increment) ->
+%% the local stream windows for all active streams and perhaps
+%% resume sending data.
+update_streams_local_window(State=#state{streams=Streams0}, Increment) ->
 	Streams = [
 		S#stream{local_window=StreamWindow + Increment}
 	|| S=#stream{local_window=StreamWindow} <- Streams0],
 	resume_streams(State, Streams, []).
+
+%% When we receive an ack to a SETTINGS frame we sent we need to update
+%% the remote stream windows for all active streams.
+update_streams_remote_window(State=#state{streams=Streams0}, Increment) ->
+	Streams = [
+		S#stream{remote_window=StreamWindow + Increment}
+	|| S=#stream{remote_window=StreamWindow} <- Streams0],
+	State#state{streams=Streams}.
 
 resume_streams(State, [], Acc) ->
 	State#state{streams=lists:reverse(Acc)};
@@ -713,8 +851,6 @@ resume_streams(State0, [Stream0|Tail], Acc) ->
 send_data(State, Stream=#stream{local=Local, local_buffer_size=0, local_trailers=Trailers})
 		when (Trailers =/= undefined) andalso ((Local =:= idle) orelse (Local =:= nofin)) ->
 	send_trailers(State, Stream#stream{local_trailers=undefined}, Trailers);
-%% @todo We might want to print an error if local=fin.
-%%
 %% @todo It's possible that the stream terminates. We must remove it.
 send_data(State=#state{local_window=ConnWindow},
 		Stream=#stream{local=IsFin, local_window=StreamWindow, local_buffer_size=BufferSize})
@@ -738,15 +874,19 @@ send_data(State, Stream=#stream{local_buffer_size=0}, fin, {trailers, Trailers},
 send_data(State, Stream, fin, {trailers, Trailers}, _) ->
 	{State, Stream#stream{local_trailers=Trailers}};
 %% Send data immediately if we can, buffer otherwise.
-%% @todo We might want to print an error if local=fin.
 send_data(State=#state{local_window=ConnWindow},
 		Stream=#stream{local_window=StreamWindow}, IsFin, Data, In)
 		when ConnWindow =< 0; StreamWindow =< 0 ->
 	{State, queue_data(Stream, IsFin, Data, In)};
-send_data(State=#state{socket=Socket, transport=Transport, local_window=ConnWindow},
+send_data(State=#state{socket=Socket, transport=Transport, opts=Opts,
+		remote_settings=RemoteSettings, local_window=ConnWindow},
 		Stream=#stream{id=StreamID, local_window=StreamWindow}, IsFin, Data, In) ->
-	MaxFrameSize = 16384, %% @todo Use the real SETTINGS_MAX_FRAME_SIZE set by the client.
-	MaxSendSize = min(min(ConnWindow, StreamWindow), MaxFrameSize),
+	RemoteMaxFrameSize = maps:get(max_frame_size, RemoteSettings, 16384),
+	ConfiguredMaxFrameSize = maps:get(max_frame_size_sent, Opts, infinity),
+	MaxSendSize = min(
+		min(ConnWindow, StreamWindow),
+		min(RemoteMaxFrameSize, ConfiguredMaxFrameSize)
+	),
 	case Data of
 		{sendfile, Offset, Bytes, Path} when Bytes =< MaxSendSize ->
 			Transport:send(Socket, cow_http2:data_header(StreamID, IsFin, Bytes)),
@@ -833,15 +973,40 @@ terminate_all_streams([#stream{id=StreamID, state=StreamState}|Tail], Reason) ->
 stream_decode_init(State=#state{decode_state=DecodeState0}, StreamID, IsFin, HeaderBlock) ->
 	try cow_hpack:decode(HeaderBlock, DecodeState0) of
 		{Headers, DecodeState} ->
-			stream_pseudo_headers_init(State#state{decode_state=DecodeState},
+			stream_enforce_concurrency_limit(State#state{decode_state=DecodeState},
 				StreamID, IsFin, Headers)
 	catch _:_ ->
 		terminate(State, {connection_error, compression_error,
 			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'})
 	end.
 
-stream_pseudo_headers_init(State, StreamID, IsFin, Headers0) ->
+stream_enforce_concurrency_limit(State=#state{opts=Opts, streams=Streams},
+		StreamID, IsFin, Headers) ->
+	MaxConcurrentStreams = maps:get(max_concurrent_streams, Opts, infinity),
+	case length(Streams) < MaxConcurrentStreams of
+		true ->
+			stream_pseudo_headers_init(State, StreamID, IsFin, Headers);
+		false ->
+			stream_refused(State, StreamID,
+				'Maximum number of concurrent streams has been reached. (RFC7540 5.1.2)')
+	end.
+
+stream_pseudo_headers_init(State=#state{local_settings=LocalSettings},
+		StreamID, IsFin, Headers0) ->
+	IsExtendedConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, false),
 	case pseudo_headers(Headers0, #{}) of
+		{ok, PseudoHeaders=#{method := <<"CONNECT">>, scheme := _,
+			authority := _, path := _, protocol := _}, Headers}
+			when IsExtendedConnectEnabled ->
+			stream_regular_headers_init(State, StreamID, IsFin, Headers, PseudoHeaders);
+		{ok, #{method := <<"CONNECT">>, scheme := _,
+			authority := _, path := _}, _}
+			when IsExtendedConnectEnabled ->
+			stream_malformed(State, StreamID,
+				'The :protocol pseudo-header MUST be sent with an extended CONNECT. (draft_h2_websockets 4)');
+		{ok, #{protocol := _}, _} ->
+			stream_malformed(State, StreamID,
+				'The :protocol pseudo-header is only defined for the extended CONNECT. (draft_h2_websockets 4)');
 		%% @todo Add clause for CONNECT requests (no scheme/path).
 		{ok, PseudoHeaders=#{method := <<"CONNECT">>}, _} ->
 			stream_early_error(State, StreamID, IsFin, 501, PseudoHeaders,
@@ -869,13 +1034,15 @@ pseudo_headers([{<<":scheme">>, Scheme}|Tail], PseudoHeaders) ->
 pseudo_headers([{<<":authority">>, _}|_], #{authority := _}) ->
 	{error, 'Multiple :authority pseudo-headers were found. (RFC7540 8.1.2.3)'};
 pseudo_headers([{<<":authority">>, Authority}|Tail], PseudoHeaders) ->
-	%% @todo Probably parse the authority here.
 	pseudo_headers(Tail, PseudoHeaders#{authority => Authority});
 pseudo_headers([{<<":path">>, _}|_], #{path := _}) ->
 	{error, 'Multiple :path pseudo-headers were found. (RFC7540 8.1.2.3)'};
 pseudo_headers([{<<":path">>, Path}|Tail], PseudoHeaders) ->
-	%% @todo Probably parse the path here.
 	pseudo_headers(Tail, PseudoHeaders#{path => Path});
+pseudo_headers([{<<":protocol">>, _}|_], #{protocol := _}) ->
+	{error, 'Multiple :protocol pseudo-headers were found. (RFC7540 8.1.2.3)'};
+pseudo_headers([{<<":protocol">>, Protocol}|Tail], PseudoHeaders) ->
+	pseudo_headers(Tail, PseudoHeaders#{protocol => Protocol});
 pseudo_headers([{<<":", _/bits>>, _}|_], _) ->
 	{error, 'An unknown or invalid pseudo-header was found. (RFC7540 8.1.2.1)'};
 pseudo_headers(Headers, PseudoHeaders) ->
@@ -927,24 +1094,30 @@ headers_to_map([{Name, Value}|Tail], Acc0) ->
 	end,
 	headers_to_map(Tail, Acc).
 
-stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
-		StreamID, IsFin, Headers, #{method := Method, scheme := Scheme,
-			authority := Authority, path := PathWithQs}) ->
-	BodyLength = case Headers of
+stream_req_init(State, StreamID, IsFin, Headers, PseudoHeaders) ->
+	case Headers of
+		#{<<"content-length">> := BinLength} when BinLength =/= <<"0">>, IsFin =:= fin ->
+			stream_malformed(State, StreamID,
+				'HEADERS frame with the END_STREAM flag contains a non-zero content-length. (RFC7540 8.1.2.6)');
 		_ when IsFin =:= fin ->
-			0;
+			stream_req_init(State, StreamID, IsFin, Headers, PseudoHeaders, 0);
 		#{<<"content-length">> := <<"0">>} ->
-			0;
+			stream_req_init(State, StreamID, IsFin, Headers, PseudoHeaders, 0);
 		#{<<"content-length">> := BinLength} ->
 			try
-				cow_http_hd:parse_content_length(BinLength)
+				stream_req_init(State, StreamID, IsFin, Headers, PseudoHeaders,
+					cow_http_hd:parse_content_length(BinLength))
 			catch _:_ ->
-				terminate(State, {stream_error, StreamID, protocol_error,
-					'The content-length header is invalid. (RFC7230 3.3.2)'})
+				stream_malformed(State, StreamID,
+					'The content-length header is invalid. (RFC7230 3.3.2)')
 			end;
 		_ ->
-			undefined
-	end,
+			stream_req_init(State, StreamID, IsFin, Headers, PseudoHeaders, undefined)
+	end.
+
+stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
+		StreamID, IsFin, Headers, PseudoHeaders=#{method := Method, scheme := Scheme,
+			authority := Authority, path := PathWithQs}, BodyLength) ->
 	try cow_http_hd:parse_host(Authority) of
 		{Host, Port} ->
 			try cow_http:parse_fullpath(PathWithQs) of
@@ -952,7 +1125,7 @@ stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
 					stream_malformed(State, StreamID,
 						'The path component must not be empty. (RFC7540 8.1.2.3)');
 				{Path, Qs} ->
-					Req = #{
+					Req0 = #{
 						ref => Ref,
 						pid => self(),
 						streamid => StreamID,
@@ -970,6 +1143,13 @@ stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
 						has_body => IsFin =:= nofin,
 						body_length => BodyLength
 					},
+					%% We add the protocol information for extended CONNECTs.
+					Req = case PseudoHeaders of
+						#{protocol := Protocol} ->
+							Req0#{protocol => Protocol};
+						_ ->
+							Req0
+					end,
 					stream_handler_init(State, StreamID, IsFin, idle, Req)
 			catch _:_ ->
 				stream_malformed(State, StreamID,
@@ -980,8 +1160,16 @@ stream_req_init(State=#state{ref=Ref, peer=Peer, sock=Sock, cert=Cert},
 			'The :authority pseudo-header is invalid. (RFC7540 8.1.2.3)')
 	end.
 
+stream_closed(State=#state{socket=Socket, transport=Transport}, StreamID, _) ->
+	Transport:send(Socket, cow_http2:rst_stream(StreamID, stream_closed)),
+	State.
+
 stream_malformed(State=#state{socket=Socket, transport=Transport}, StreamID, _) ->
 	Transport:send(Socket, cow_http2:rst_stream(StreamID, protocol_error)),
+	State.
+
+stream_refused(State=#state{socket=Socket, transport=Transport}, StreamID, _) ->
+	Transport:send(Socket, cow_http2:rst_stream(StreamID, refused_stream)),
 	State.
 
 stream_early_error(State0=#state{ref=Ref, opts=Opts, peer=Peer,
@@ -1025,13 +1213,14 @@ stream_handler_init(State=#state{opts=Opts,
 		local_settings=#{initial_window_size := RemoteWindow},
 		remote_settings=#{initial_window_size := LocalWindow}},
 		StreamID, RemoteIsFin, LocalIsFin,
-		Req=#{method := Method, headers := Headers}) ->
+		Req=#{method := Method, headers := Headers, body_length := BodyLength}) ->
 	try cowboy_stream:init(StreamID, Req, Opts) of
 		{Commands, StreamState} ->
 			commands(State#state{client_streamid=StreamID},
 				#stream{id=StreamID, state=StreamState,
 					method=Method, remote=RemoteIsFin, local=LocalIsFin,
 					local_window=LocalWindow, remote_window=RemoteWindow,
+					remote_expected_size=BodyLength,
 					te=maps:get(<<"te">>, Headers, undefined)},
 				Commands)
 	catch Class:Exception ->
@@ -1041,6 +1230,43 @@ stream_handler_init(State=#state{opts=Opts,
 		stream_reset(State, StreamID, {internal_error, {Class, Exception},
 			'Unhandled exception in cowboy_stream:init/3.'})
 	end.
+
+stream_decode_trailers(State=#state{decode_state=DecodeState0}, Stream, HeaderBlock) ->
+	try cow_hpack:decode(HeaderBlock, DecodeState0) of
+		{Headers, DecodeState} ->
+			stream_trailers_is_body_size_valid(State#state{decode_state=DecodeState},
+				Stream#stream{remote=fin}, Headers)
+	catch _:_ ->
+		terminate(State, {connection_error, compression_error,
+			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'})
+	end.
+
+stream_trailers_is_body_size_valid(State, Stream=#stream{id=StreamID}, Headers) ->
+	case is_body_size_valid(Stream) of
+		true ->
+			stream_reject_pseudo_headers_in_trailers(State, Stream, Headers);
+		false ->
+			stream_reset(after_commands(State, Stream), StreamID, {stream_error, protocol_error,
+				'The total size of DATA frames is different than the content-length. (RFC7540 8.1.2.6)'})
+	end.
+
+stream_reject_pseudo_headers_in_trailers(State, Stream=#stream{id=StreamID}, Headers) ->
+	case has_pseudo_header(Headers) of
+		false ->
+			%% @todo There's probably a number of regular headers forbidden too.
+			%% @todo Propagate trailers.
+			after_commands(State, Stream);
+		true ->
+			stream_reset(after_commands(State, Stream), StreamID, {stream_error, protocol_error,
+				'Trailer header blocks must not contain pseudo-headers. (RFC7540 8.1.2.1)'})
+	end.
+
+has_pseudo_header([]) ->
+	false;
+has_pseudo_header([{<<":", _/bits>>, _}|_]) ->
+	true;
+has_pseudo_header([_|Tail]) ->
+	has_pseudo_header(Tail).
 
 %% @todo Don't send an RST_STREAM if one was already sent.
 stream_reset(State=#state{socket=Socket, transport=Transport}, StreamID, StreamError) ->
@@ -1055,6 +1281,11 @@ stream_reset(State=#state{socket=Socket, transport=Transport}, StreamID, StreamE
 stream_linger(State=#state{lingering_streams=Lingering0}, StreamID) ->
 	Lingering = [StreamID|lists:sublist(Lingering0, 100 - 1)],
 	State#state{lingering_streams=Lingering}.
+
+%% We only keep up to 10 streams in this state. @todo Make it configurable?
+stream_rst_linger(State=#state{rst_lingering_streams=Lingering0}, StreamID) ->
+	Lingering = [StreamID|lists:sublist(Lingering0, 10 - 1)],
+	State#state{rst_lingering_streams=Lingering}.
 
 stream_terminate(State0=#state{streams=Streams0, children=Children0}, StreamID, Reason) ->
 	case lists:keytake(StreamID, #stream.id, Streams0) of
@@ -1128,6 +1359,7 @@ system_continue(_, _, {State, Buffer}) ->
 
 -spec system_terminate(any(), _, _, {#state{}, binary()}) -> no_return().
 system_terminate(Reason, _, _, {State, _}) ->
+	%% @todo We should exit gracefully, if possible.
 	terminate(State, Reason).
 
 -spec system_code_change(Misc, _, _, _) -> {ok, Misc} when Misc::{#state{}, binary()}.

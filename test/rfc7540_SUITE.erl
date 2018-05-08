@@ -18,6 +18,7 @@
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
+-import(ct_helper, [name/0]).
 -import(cowboy_test, [gun_open/1]).
 -import(cowboy_test, [raw_open/1]).
 -import(cowboy_test, [raw_send/2]).
@@ -48,6 +49,7 @@ init_routes(_) -> [
 	{"localhost", [
 		{"/", hello_h, []},
 		{"/echo/:key", echo_h, []},
+		{"/long_polling", long_polling_h, []},
 		{"/resp/:key[/:arg]", resp_h, []}
 	]}
 ].
@@ -383,9 +385,24 @@ http_upgrade_accept_client_preface_empty_settings(Config) ->
 	%% Receive the server preface.
 	{ok, << Len:24 >>} = gen_tcp:recv(Socket, 3, 1000),
 	{ok, << 4:8, 0:40, _:Len/binary >>} = gen_tcp:recv(Socket, 6 + Len, 1000),
-	%% Receive the SETTINGS ack.
-	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
-	ok.
+	%% Receive the SETTINGS ack. The response might arrive beforehand.
+	Received = lists:reverse(lists:foldl(fun(_, Acc) ->
+		case gen_tcp:recv(Socket, 9, 1000) of
+			{ok, << SkipLen:24, 1:8, _:8, 1:32 >>} ->
+				{ok, _} = gen_tcp:recv(Socket, SkipLen, 1000),
+				[headers|Acc];
+			{ok, << SkipLen:24, 0:8, _:8, 1:32 >>} ->
+				{ok, _} = gen_tcp:recv(Socket, SkipLen, 1000),
+				[data|Acc];
+			{ok, << 0:24, 4:8, 1:8, 0:32 >>} ->
+				[settings_ack|Acc]
+		end
+	end, [], [1, 2, 3])),
+	case Received of
+		[settings_ack|_] -> ok;
+		[headers, settings_ack|_] -> ok;
+		[headers, data, settings_ack] -> ok
+	end.
 
 http_upgrade_client_preface_settings_ack_timeout(Config) ->
 	doc("The SETTINGS frames sent by the client must be acknowledged. (RFC7540 3.5, RFC7540 6.5.3)"),
@@ -403,11 +420,32 @@ http_upgrade_client_preface_settings_ack_timeout(Config) ->
 	%% Receive the server preface.
 	{ok, << Len:24 >>} = gen_tcp:recv(Socket, 3, 1000),
 	{ok, << 4:8, 0:40, _:Len/binary >>} = gen_tcp:recv(Socket, 6 + Len, 1000),
-	%% Receive the SETTINGS ack.
-	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
-	%% Do not ack the server preface. Expect a GOAWAY with reason SETTINGS_TIMEOUT.
-	{ok, << _:24, 7:8, _:72, 4:32 >>} = gen_tcp:recv(Socket, 17, 6000),
-	ok.
+	%% Skip the SETTINGS ack. Receive a GOAWAY with reason SETTINGS_TIMEOUT,
+	%% possibly following a HEADERS or HEADERS and DATA frames.
+	Received = lists:reverse(lists:foldl(fun(_, Acc) ->
+		case gen_tcp:recv(Socket, 9, 6000) of
+			{ok, << 0:24, 4:8, 1:8, 0:32 >>} ->
+				Acc;
+			{ok, << SkipLen:24, 1:8, _:8, 1:32 >>} ->
+				{ok, _} = gen_tcp:recv(Socket, SkipLen, 1000),
+				[headers|Acc];
+			{ok, << SkipLen:24, 0:8, _:8, 1:32 >>} ->
+				{ok, _} = gen_tcp:recv(Socket, SkipLen, 1000),
+				[data|Acc];
+			{ok, << 8:24, 7:8, 0:40 >>} ->
+				%% We expect a SETTINGS_TIMEOUT reason.
+				{ok, << 1:32, 4:32 >>} = gen_tcp:recv(Socket, 8, 1000),
+				[goaway|Acc];
+			{error, _} ->
+				%% Can be timeouts, ignore them.
+				Acc
+		end
+	end, [], [1, 2, 3, 4])),
+	case Received of
+		[goaway] -> ok;
+		[headers, goaway] -> ok;
+		[headers, data, goaway] -> ok
+	end.
 
 %% @todo We need a successful test with actual options in HTTP2-Settings.
 %% SETTINGS_MAX_FRAME_SIZE is probably the easiest to test. The relevant
@@ -492,7 +530,7 @@ http_upgrade_response_half_closed(Config) ->
 	%% Try sending more data after the upgrade and get an error.
 	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
 	ok = gen_tcp:send(Socket, [
-		"GET / HTTP/1.1\r\n"
+		"GET /long_polling HTTP/1.1\r\n"
 		"Host: localhost\r\n"
 		"Connection: Upgrade, HTTP2-Settings\r\n"
 		"Upgrade: h2c\r\n"
@@ -508,7 +546,10 @@ http_upgrade_response_half_closed(Config) ->
 	%% Receive the server preface.
 	{ok, << Len:24 >>} = gen_tcp:recv(Socket, 3, 1000),
 	{ok, << 4:8, 0:40, _:Len/binary >>} = gen_tcp:recv(Socket, 6 + Len, 1000),
-	%% Skip the SETTINGS ack, receive the response HEADERS, DATA and RST_STREAM (streamid 1).
+	%% Skip the SETTINGS ack. Receive an RST_STREAM possibly following by
+	%% a HEADERS frame, or a GOAWAY following HEADERS and DATA. This
+	%% corresponds to the stream being in half-closed and closed states.
+	%% The reason must be STREAM_CLOSED.
 	Received = lists:reverse(lists:foldl(fun(_, Acc) ->
 		case gen_tcp:recv(Socket, 9, 1000) of
 			{ok, << 0:24, 4:8, 1:8, 0:32 >>} ->
@@ -523,6 +564,10 @@ http_upgrade_response_half_closed(Config) ->
 				%% We expect a STREAM_CLOSED reason.
 				{ok, << 5:32 >>} = gen_tcp:recv(Socket, 4, 1000),
 				[rst_stream|Acc];
+			{ok, << 8:24, 7:8, 0:40 >>} ->
+				%% We expect a STREAM_CLOSED reason.
+				{ok, << 1:32, 5:32 >>} = gen_tcp:recv(Socket, 8, 1000),
+				[goaway|Acc];
 			{error, _} ->
 				%% Can be timeouts, ignore them.
 				Acc
@@ -531,7 +576,7 @@ http_upgrade_response_half_closed(Config) ->
 	case Received of
 		[rst_stream] -> ok;
 		[headers, rst_stream] -> ok;
-		[headers, data, rst_stream] -> ok
+		[headers, data, goaway] -> ok
 	end.
 
 %% Starting HTTP/2 for "https" URIs.
@@ -1275,64 +1320,62 @@ max_frame_size_reject_larger_than_default(Config) ->
 	{ok, << _:24, 7:8, _:72, 6:32 >>} = gen_tcp:recv(Socket, 17, 6000),
 	ok.
 
-%% @todo We need configurable SETTINGS in Cowboy for these tests.
-%%	max_frame_size_config_reject_too_small(Config) ->
-%%		doc("SETTINGS_MAX_FRAME_SIZE configuration values smaller than "
-%%			"16384 must be rejected. (RFC7540 6.5.2)"),
-%%		%% @todo This requires us to have a configurable SETTINGS in Cowboy.
-%%		todo.
-%%
-%%	max_frame_size_config_reject_too_large(Config) ->
-%%		doc("SETTINGS_MAX_FRAME_SIZE configuration values larger than "
-%%			"16777215 must be rejected. (RFC7540 6.5.2)"),
-%%		%% @todo This requires us to have a configurable SETTINGS in Cowboy.
-%%		todo.
-%%
-%%	max_frame_size_allow_exactly_custom(Config) ->
-%%		doc("An endpoint that sets SETTINGS_MAX_FRAME_SIZE must allow frames "
-%%			"of up to that size. (RFC7540 4.2, RFC7540 6.5.2)"),
-%%		%% @todo This requires us to have a configurable SETTINGS in Cowboy.
-%%		todo.
-%%
-%%	max_frame_size_reject_larger_than_custom(Config) ->
-%%		doc("An endpoint that sets SETTINGS_MAX_FRAME_SIZE must reject frames "
-%%			"of up to that size with a FRAME_SIZE_ERROR connection error. (RFC7540 4.2, RFC7540 6.5.2)"),
-%%		%% @todo This requires us to have a configurable SETTINGS in Cowboy.
-%%		todo.
-
-%% @todo How do I test this?
-%%
-%%	max_frame_size_client_default_respect_limits(Config) ->
-%%		doc("The server must not send frame sizes of more "
-%%			"than 16384 by default. (RFC7540 4.1, RFC7540 4.2)"),
-
-%% This is about the client sending a SETTINGS frame.
-max_frame_size_client_override_reject_too_small(Config) ->
-	doc("A SETTINGS_MAX_FRAME_SIZE smaller than 16384 must be rejected "
-		"with a PROTOCOL_ERROR connection error. (RFC7540 6.5.2)"),
+max_frame_size_allow_exactly_custom(Config0) ->
+	doc("An endpoint that sets SETTINGS_MAX_FRAME_SIZE must allow frames "
+		"of up to that size. (RFC7540 4.2, RFC7540 6.5.2)"),
+	%% Create a new listener that sets the maximum frame size to 30000.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_frame_size_received => 30000
+	}, Config0),
+	%% Do the handshake.
 	{ok, Socket} = do_handshake(Config),
-	%% Send a SETTINGS frame with a SETTINGS_MAX_FRAME_SIZE lower than 16384.
-	ok = gen_tcp:send(Socket, << 6:24, 4:8, 0:40, 5:16, 16383:32 >>),
-	%% Receive a PROTOCOL_ERROR connection error.
-	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% a single 30000 bytes DATA frame.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, fin, <<0:30000/unit:8>>)
+	]),
+	%% Receive a proper response.
+	{ok, << Len2:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
+	%% No errors follow due to our sending of a 25000 bytes frame.
+	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
 	ok.
 
-%% This is about the client sending a SETTINGS frame.
-max_frame_size_client_override_reject_too_large(Config) ->
-	doc("A SETTINGS_MAX_FRAME_SIZE larger than 16777215 must be rejected "
-		"with a PROTOCOL_ERROR connection error. (RFC7540 6.5.2)"),
+max_frame_size_reject_larger_than_custom(Config0) ->
+	doc("An endpoint that sets SETTINGS_MAX_FRAME_SIZE must reject frames "
+		"of up to that size with a FRAME_SIZE_ERROR connection error. (RFC7540 4.2, RFC7540 6.5.2)"),
+	%% Create a new listener that sets the maximum frame size to 30000.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_frame_size_received => 30000
+	}, Config0),
+	%% Do the handshake.
 	{ok, Socket} = do_handshake(Config),
-	%% Send a SETTINGS frame with a SETTINGS_MAX_FRAME_SIZE larger than 16777215.
-	ok = gen_tcp:send(Socket, << 6:24, 4:8, 0:40, 5:16, 16777216:32 >>),
-	%% Receive a PROTOCOL_ERROR connection error.
-	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% a single DATA frame larger than 30000 bytes.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, fin, <<0:30001/unit:8>>)
+	]),
+	%% Receive a FRAME_SIZE_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 6:32 >>} = gen_tcp:recv(Socket, 17, 6000),
 	ok.
-
-%% @todo How do I test this?
-%%
-%%	max_frame_size_client_custom_respect_limits(Config) ->
-%%		doc("The server must not send frame sizes of more than "
-%%			"client's advertised limits. (RFC7540 4.1, RFC7540 4.2)"),
 
 %% I am using FRAME_SIZE_ERROR here because the information in the
 %% frame header tells us this frame is at least 1 byte long, while
@@ -1850,7 +1893,7 @@ half_closed_remote_accept_rst_stream(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Send an RST_STREAM frame on that now half-closed (remote) stream.
@@ -2173,9 +2216,11 @@ reject_streamid_0(Config) ->
 	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
 	ok.
 
+%% See the comment for reject_streamid_lower for the rationale behind
+%% having a STREAM_CLOSED connection error.
 http_upgrade_reject_reuse_streamid_1(Config) ->
 	doc("Attempts to reuse streamid 1 after upgrading to HTTP/2 "
-		"must be rejected with a PROTOCOL_ERROR connection error. (RFC7540 5.1.1)"),
+		"must be rejected with a STREAM_CLOSED connection error. (RFC7540 5.1.1)"),
 	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
 	ok = gen_tcp:send(Socket, [
 		"GET / HTTP/1.1\r\n"
@@ -2218,8 +2263,8 @@ http_upgrade_reject_reuse_streamid_1(Config) ->
 		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
-	%% Receive a PROTOCOL_ERROR connection error.
-	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	%% Receive a STREAM_CLOSED connection error.
+	{ok, << _:24, 7:8, _:72, 5:32 >>} = gen_tcp:recv(Socket, 17, 6000),
 	ok.
 
 %% The RFC gives us various error codes to return for this case,
@@ -2262,34 +2307,6 @@ reject_streamid_lower(Config) ->
 %   frame so that the client is forced to open a new connection for new
 %   streams.
 
-%% @todo We need this option too. (RFC7540 5.1.2)
-%   A peer can limit the number of concurrently active streams using the
-%   SETTINGS_MAX_CONCURRENT_STREAMS parameter (see Section 6.5.2) within
-%   a SETTINGS frame.  The maximum concurrent streams setting is specific
-%   to each endpoint and applies only to the peer that receives the
-%   setting.  That is, clients specify the maximum number of concurrent
-%   streams the server can initiate, and servers specify the maximum
-%   number of concurrent streams the client can initiate.
-%
-%   Streams that are in the "open" state or in either of the "half-
-%   closed" states count toward the maximum number of streams that an
-%   endpoint is permitted to open.  Streams in any of these three states
-%   count toward the limit advertised in the
-%   SETTINGS_MAX_CONCURRENT_STREAMS setting.  Streams in either of the
-%   "reserved" states do not count toward the stream limit.
-%
-%   Endpoints MUST NOT exceed the limit set by their peer.  An endpoint
-%   that receives a HEADERS frame that causes its advertised concurrent
-%   stream limit to be exceeded MUST treat this as a stream error
-%   (Section 5.4.2) of type PROTOCOL_ERROR or REFUSED_STREAM.  The choice
-%   of error code determines whether the endpoint wishes to enable
-%   automatic retry (see Section 8.1.4) for details).
-%
-%   An endpoint that wishes to reduce the value of
-%   SETTINGS_MAX_CONCURRENT_STREAMS to a value that is below the current
-%   number of open streams can either close streams that exceed the new
-%   value or allow streams to complete.
-
 %% (RFC7540 5.2.1)
 %   3.  Flow control is directional with overall control provided by the
 %       receiver.  A receiver MAY choose to set any window size that it
@@ -2318,7 +2335,49 @@ reject_streamid_lower(Config) ->
 %   timely fashion.  Failure to do so could lead to a deadlock when
 %   critical frames, such as WINDOW_UPDATE, are not read and acted upon.
 
-%% @todo Stream priorities. (RFC7540 5.3 5.3.x)
+%% (RFC7540 5.3.1)
+%   Inside the dependency tree, a dependent stream SHOULD only be
+%   allocated resources if either all of the streams that it depends on
+%   (the chain of parent streams up to 0x0) are closed or it is not
+%   possible to make progress on them.
+
+%% We reject all invalid HEADERS with a connection error because
+%% we do not want to waste resources decoding them.
+reject_self_dependent_stream_headers(Config) ->
+	doc("HEADERS frames opening a stream that depends on itself "
+		"must be rejected with a PROTOCOL_ERROR connection error. (RFC7540 5.3.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with priority set to depend on itself.
+	ok = gen_tcp:send(Socket, << 5:24, 1:8,
+		0:2, 1:1, 0:4, 1:1, 0:1, 1:31, 0:1, 1:31, 0:8 >>),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+%% We reject all invalid HEADERS with a connection error because
+%% we do not want to waste resources decoding them.
+reject_self_dependent_stream_headers_with_padding(Config) ->
+	doc("HEADERS frames opening a stream that depends on itself "
+		"must be rejected with a PROTOCOL_ERROR connection error. (RFC7540 5.3.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with priority set to depend on itself.
+	ok = gen_tcp:send(Socket, << 6:24, 1:8,
+		0:2, 1:1, 0:1, 1:1, 0:2, 1:1, 0:1, 1:31, 0:8, 0:1, 1:31, 0:8 >>),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+reject_self_dependent_stream_priority(Config) ->
+	doc("PRIORITY frames making a stream depend on itself "
+		"must be rejected with a PROTOCOL_ERROR stream error. (RFC7540 5.3.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a PRIORITY frame making a stream depend on itself.
+	ok = gen_tcp:send(Socket, cow_http2:priority(1, shared, 1, 123)),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+%% @todo Stream priorities. (RFC7540 5.3.2 5.3.3 5.3.4 5.3.5)
 
 %% (RFC7540 5.4.1)
 %   An endpoint that encounters a connection error SHOULD first send a
@@ -2448,39 +2507,354 @@ continuation_with_extension_frame_interleaved_error(Config) ->
 %   incomplete SETTINGS frame MUST be treated as a connection error
 %   (Section 5.4.1) of type PROTOCOL_ERROR.
 
-%% (RFC7540 6.5.2)
+%% Settings.
+
+settings_header_table_size_client(Config) ->
+	doc("The SETTINGS_HEADER_TABLE_SIZE setting can be used to "
+		"inform the server of the maximum header table size "
+		"used by the client to decode header blocks. (RFC7540 6.5.2)"),
+	HeaderTableSize = 128,
+	%% Do the handhsake.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+		cow_http2:settings(#{header_table_size => HeaderTableSize})]),
+	%% Receive the server preface.
+	{ok, << Len0:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len0/binary >>} = gen_tcp:recv(Socket, 6 + Len0, 1000),
+	%% Send the SETTINGS ack.
+	ok = gen_tcp:send(Socket, cow_http2:settings_ack()),
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Initialize decoding/encoding states.
+	DecodeState = cow_hpack:set_max_size(HeaderTableSize, cow_hpack:init()),
+	EncodeState = cow_hpack:init(),
+	%% Send a HEADERS frame as a request.
+	{ReqHeadersBlock1, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, ReqHeadersBlock1)),
+	%% Receive a HEADERS frame as a response.
+	{ok, << Len1:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, RespHeadersBlock1} = gen_tcp:recv(Socket, Len1, 6000),
+	{RespHeaders, _} = cow_hpack:decode(RespHeadersBlock1, DecodeState),
+	{_, <<"200">>} = lists:keyfind(<<":status">>, 1, RespHeaders),
+	%% The decoding succeeded, confirming that the table size is
+	%% lower than or equal to HeaderTableSize.
+	ok.
+
+settings_header_table_size_server(Config0) ->
+	doc("The SETTINGS_HEADER_TABLE_SIZE setting can be used to "
+		"inform the client of the maximum header table size "
+		"used by the server to decode header blocks. (RFC7540 6.5.2)"),
+	HeaderTableSize = 128,
+	%% Create a new listener that allows larger header table sizes.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_decode_table_size => HeaderTableSize
+	}, Config0),
+	%% Do the handhsake.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+		cow_http2:settings(#{header_table_size => HeaderTableSize})]),
+	%% Receive the server preface.
+	{ok, << Len0:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, Data = <<_:48, _:Len0/binary>>} = gen_tcp:recv(Socket, 6 + Len0, 1000),
+	%% Confirm the server's SETTINGS_HEADERS_TABLE_SIZE uses HeaderTableSize.
+	{ok, {settings, #{header_table_size := HeaderTableSize}}, <<>>}
+		= cow_http2:parse(<<Len0:24, Data/binary>>),
+	%% Send the SETTINGS ack.
+	ok = gen_tcp:send(Socket, cow_http2:settings_ack()),
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Initialize decoding/encoding states.
+	DecodeState = cow_hpack:init(),
+	EncodeState = cow_hpack:set_max_size(HeaderTableSize, cow_hpack:init()),
+	%% Send a HEADERS frame as a request.
+	{ReqHeadersBlock1, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, ReqHeadersBlock1)),
+	%% Receive a HEADERS frame as a response.
+	{ok, << Len1:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, RespHeadersBlock1} = gen_tcp:recv(Socket, Len1, 6000),
+	{RespHeaders, _} = cow_hpack:decode(RespHeadersBlock1, DecodeState),
+	{_, <<"200">>} = lists:keyfind(<<":status">>, 1, RespHeaders),
+	%% The decoding succeeded on the server, confirming that
+	%% the table size was updated to HeaderTableSize.
+	ok.
+
 %   SETTINGS_ENABLE_PUSH (0x2):  This setting can be used to disable
 %      server push (Section 8.2).  An endpoint MUST NOT send a
 %      PUSH_PROMISE frame if it receives this parameter set to a value of
 %      0.  An endpoint that has both set this parameter to 0 and had it
 %      acknowledged MUST treat the receipt of a PUSH_PROMISE frame as a
 %      connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+%% @todo settings_disable_push
+
+settings_max_concurrent_streams(Config0) ->
+	doc("The SETTINGS_MAX_CONCURRENT_STREAMS setting can be used to "
+		"restrict the number of concurrent streams. (RFC7540 5.1.2, RFC7540 6.5.2)"),
+	%% Create a new listener that allows only a single concurrent stream.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_concurrent_streams => 1
+	}, Config0),
+	{ok, Socket} = do_handshake(Config),
+	%% Send two HEADERS frames as two separate streams.
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{ReqHeadersBlock1, EncodeState} = cow_hpack:encode(Headers),
+	{ReqHeadersBlock2, _} = cow_hpack:encode(Headers, EncodeState),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, fin, ReqHeadersBlock1),
+		cow_http2:headers(3, fin, ReqHeadersBlock2)
+	]),
+	%% Receive a REFUSED_STREAM stream error.
+	{ok, << _:24, 3:8, _:8, 3:32, 7:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+settings_max_concurrent_streams_0(Config0) ->
+	doc("The SETTINGS_MAX_CONCURRENT_STREAMS setting can be set to "
+		"0 to refuse all incoming streams. (RFC7540 5.1.2, RFC7540 6.5.2)"),
+	%% Create a new listener that allows only a single concurrent stream.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_concurrent_streams => 0
+	}, Config0),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
+	%% Receive a REFUSED_STREAM stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 7:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+%% @todo The client can limit the number of concurrent streams too. (RFC7540 5.1.2)
 %
-%   SETTINGS_MAX_CONCURRENT_STREAMS (0x3):  Indicates the maximum number
-%      of concurrent streams that the sender will allow.  This limit is
-%      directional: it applies to the number of streams that the sender
-%      permits the receiver to create.  Initially, there is no limit to
-%      this value.  It is recommended that this value be no smaller than
-%      100, so as to not unnecessarily limit parallelism.
+%   A peer can limit the number of concurrently active streams using the
+%   SETTINGS_MAX_CONCURRENT_STREAMS parameter (see Section 6.5.2) within
+%   a SETTINGS frame.  The maximum concurrent streams setting is specific
+%   to each endpoint and applies only to the peer that receives the
+%   setting.  That is, clients specify the maximum number of concurrent
+%   streams the server can initiate, and servers specify the maximum
+%   number of concurrent streams the client can initiate.
 %
-%      A value of 0 for SETTINGS_MAX_CONCURRENT_STREAMS SHOULD NOT be
-%      treated as special by endpoints.  A zero value does prevent the
-%      creation of new streams; however, this can also happen for any
-%      limit that is exhausted with active streams.  Servers SHOULD only
-%      set a zero value for short durations; if a server does not wish to
-%      accept requests, closing the connection is more appropriate.
+%   Endpoints MUST NOT exceed the limit set by their peer.  An endpoint
+%   that receives a HEADERS frame that causes its advertised concurrent
+%   stream limit to be exceeded MUST treat this as a stream error
+%   (Section 5.4.2) of type PROTOCOL_ERROR or REFUSED_STREAM.  The choice
+%   of error code determines whether the endpoint wishes to enable
+%   automatic retry (see Section 8.1.4) for details).
+
+settings_initial_window_size(Config0) ->
+	doc("The SETTINGS_INITIAL_WINDOW_SIZE setting can be used to "
+		"change the initial window size of streams. (RFC7540 6.5.2)"),
+	%% Create a new listener that sets initial window sizes to 100000.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		initial_connection_window_size => 100000,
+		initial_stream_window_size => 100000
+	}, Config0),
+	%% We need to do the handshake manually because a WINDOW_UPDATE
+	%% frame will be sent to update the connection window.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", cow_http2:settings(#{})]),
+	%% Receive the server preface.
+	{ok, << Len1:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len1/binary >>} = gen_tcp:recv(Socket, 6 + Len1, 1000),
+	%% Send the SETTINGS ack.
+	ok = gen_tcp:send(Socket, cow_http2:settings_ack()),
+	%% Receive the WINDOW_UPDATE for the connection.
+	{ok, << 4:24, 8:8, 0:40, _:32 >>} = gen_tcp:recv(Socket, 13, 1000),
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% DATA frames totaling 90000 bytes of body.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, fin, <<0:15000/unit:8>>)
+	]),
+	%% Receive a proper response.
+	{ok, << Len2:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
+	%% No errors follow due to our sending of more than 65535 bytes of data.
+	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
+	ok.
+
+settings_initial_window_size_after_ack(Config0) ->
+	doc("The SETTINGS_INITIAL_WINDOW_SIZE setting can be used to "
+		"change the initial window size of streams. It is applied "
+		"to all existing streams upon receipt of the SETTINGS ack. (RFC7540 6.5.2)"),
+	%% Create a new listener that sets the initial stream window sizes to 0.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		initial_stream_window_size => 0
+	}, Config0),
+	%% We need to do the handshake manually because we don't
+	%% want to send the SETTINGS ack immediately.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", cow_http2:settings(#{})]),
+	%% Receive the server preface.
+	{ok, << Len1:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len1/binary >>} = gen_tcp:recv(Socket, 6 + Len1, 1000),
+	%%
+	%% Don't send the SETTINGS ack yet! We want to create a stream first.
+	%%
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Send a HEADERS frame initiating a stream, a SETTINGS ack
+	%% and a small DATA frame despite no window available in the stream.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:settings_ack(),
+		cow_http2:data(1, fin, <<0:32/unit:8>>)
+	]),
+	%% Receive a FLOW_CONTROL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 3:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+settings_initial_window_size_before_ack(Config0) ->
+	doc("The SETTINGS_INITIAL_WINDOW_SIZE setting can be used to "
+		"change the initial window size of streams. It is only "
+		"applied upon receipt of the SETTINGS ack. (RFC7540 6.5.2)"),
+	%% Create a new listener that sets the initial stream window sizes to 0.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		initial_stream_window_size => 0
+	}, Config0),
+	%% We need to do the handshake manually because we don't
+	%% want to send the SETTINGS ack.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", cow_http2:settings(#{})]),
+	%% Receive the server preface.
+	{ok, << Len1:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len1/binary >>} = gen_tcp:recv(Socket, 6 + Len1, 1000),
+	%%
+	%% Don't send the SETTINGS ack! We want the server to keep the original settings.
+	%%
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% DATA frames totaling 60000 bytes of body.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, fin, <<0:15000/unit:8>>)
+	]),
+	%% Receive a proper response.
+	{ok, << Len2:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
+	%% No errors follow due to our sending of more than 0 bytes of data.
+	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
+	ok.
+
+settings_max_frame_size(Config0) ->
+	doc("The SETTINGS_MAX_FRAME_SIZE setting can be used to "
+		"change the maximum frame size allowed. (RFC7540 6.5.2)"),
+	%% Create a new listener that sets the maximum frame size to 30000.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		max_frame_size_received => 30000
+	}, Config0),
+	%% Do the handshake.
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% a single 25000 bytes DATA frame.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, fin, <<0:25000/unit:8>>)
+	]),
+	%% Receive a proper response.
+	{ok, << Len2:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
+	%% No errors follow due to our sending of a 25000 bytes frame.
+	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
+	ok.
+
+settings_max_frame_size_reject_too_small(Config) ->
+	doc("A SETTINGS_MAX_FRAME_SIZE smaller than 16384 must be rejected "
+		"with a PROTOCOL_ERROR connection error. (RFC7540 6.5.2)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a SETTINGS frame with a SETTINGS_MAX_FRAME_SIZE lower than 16384.
+	ok = gen_tcp:send(Socket, << 6:24, 4:8, 0:40, 5:16, 16383:32 >>),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+settings_max_frame_size_reject_too_large(Config) ->
+	doc("A SETTINGS_MAX_FRAME_SIZE larger than 16777215 must be rejected "
+		"with a PROTOCOL_ERROR connection error. (RFC7540 6.5.2)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a SETTINGS frame with a SETTINGS_MAX_FRAME_SIZE larger than 16777215.
+	ok = gen_tcp:send(Socket, << 6:24, 4:8, 0:40, 5:16, 16777216:32 >>),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+%   SETTINGS_MAX_HEADER_LIST_SIZE (0x6):  This advisory setting informs a
+%      peer of the maximum size of header list that the sender is
+%      prepared to accept, in octets.  The value is based on the
+%      uncompressed size of header fields, including the length of the
+%      name and value in octets plus an overhead of 32 octets for each
+%      header field.
 %
-%   SETTINGS_INITIAL_WINDOW_SIZE (0x4):
-%      Values above the maximum flow-control window size of 2^31-1 MUST
-%      be treated as a connection error (Section 5.4.1) of type
-%      FLOW_CONTROL_ERROR.
-%
-%   SETTINGS_MAX_FRAME_SIZE (0x5):
-%      The initial value is 2^14 (16,384) octets.  The value advertised
-%      by an endpoint MUST be between this initial value and the maximum
-%      allowed frame size (2^24-1 or 16,777,215 octets), inclusive.
-%      Values outside this range MUST be treated as a connection error
-%      (Section 5.4.1) of type PROTOCOL_ERROR.
+%      For any given request, a lower limit than what is advertised MAY
+%      be enforced.  The initial value of this setting is unlimited.
 %
 %   An endpoint that receives a SETTINGS frame with any unknown or
 %   unsupported identifier MUST ignore that setting. (6.5.2 and 6.5.3)
@@ -2619,11 +2993,85 @@ window_update_reject_0_stream(Config) ->
 %   the receiver does not, the flow-control window at the sender and
 %   receiver can become different.
 
+data_reject_overflow(Config0) ->
+	doc("DATA frames that cause the connection flow control window "
+		"to overflow must be rejected with a FLOW_CONTROL_ERROR "
+		"connection error. (RFC7540 6.9.1)"),
+	%% Create a new listener that allows only a single concurrent stream.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		initial_stream_window_size => 100000
+	}, Config0),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% DATA frames totaling 90000 bytes of body.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, fin, <<0:15000/unit:8>>)
+	]),
+	%% Receive a FLOW_CONTROL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 3:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+data_reject_overflow_stream(Config0) ->
+	doc("DATA frames that cause the stream flow control window "
+		"to overflow must be rejected with a FLOW_CONTROL_ERROR "
+		"stream error. (RFC7540 6.9.1)"),
+	%% Create a new listener that allows only a single concurrent stream.
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config0))},
+		initial_connection_window_size => 100000
+	}, Config0),
+	%% We need to do the handshake manually because a WINDOW_UPDATE
+	%% frame will be sent to update the connection window.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", cow_http2:settings(#{})]),
+	%% Receive the server preface.
+	{ok, << Len1:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len1/binary >>} = gen_tcp:recv(Socket, 6 + Len1, 1000),
+	%% Send the SETTINGS ack.
+	ok = gen_tcp:send(Socket, cow_http2:settings_ack()),
+	%% Receive the WINDOW_UPDATE for the connection.
+	{ok, << 4:24, 8:8, 0:40, _:32 >>} = gen_tcp:recv(Socket, 13, 1000),
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Send a HEADERS frame initiating a stream followed by
+	%% DATA frames totaling 90000 bytes of body.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>}
+	],
+	{HeadersBlock, _} = cow_hpack:encode(Headers),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, nofin, <<0:15000/unit:8>>),
+		cow_http2:data(1, fin, <<0:15000/unit:8>>)
+	]),
+	%% Receive a FLOW_CONTROL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 3:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
 %% (RFC7540 6.9.1)
-%   The sender MUST NOT
-%   send a flow-controlled frame with a length that exceeds the space
-%   available in either of the flow-control windows advertised by the
-%   receiver.  Frames with zero length with the END_STREAM flag set (that
+%   Frames with zero length with the END_STREAM flag set (that
 %   is, an empty DATA frame) MAY be sent if there is no available space
 %   in either flow-control window.
 
@@ -2734,7 +3182,7 @@ settings_initial_window_size_changes_negative(Config) ->
 settings_initial_window_size_reject_overflow(Config) ->
 	doc("A SETTINGS_INITIAL_WINDOW_SIZE that causes a flow control window "
 		"to exceed 2^31-1 must be rejected with a FLOW_CONTROL_ERROR "
-		"connection error. (RFC7540 6.9.2)"),
+		"connection error. (RFC7540 6.5.2, RFC7540 6.9.2)"),
 	{ok, Socket} = do_handshake(Config),
 	%% Set SETTINGS_INITIAL_WINDOW_SIZE to 2^31.
 	ok = gen_tcp:send(Socket, cow_http2:settings(#{initial_window_size => 16#80000000})),
@@ -2767,13 +3215,135 @@ settings_initial_window_size_reject_overflow(Config) ->
 %   behavior.  These MAY be treated by an implementation as being
 %   equivalent to INTERNAL_ERROR.
 
-%% (RFC7540 8.1)
-%   A HEADERS frame (and associated CONTINUATION frames) can only appear
-%   at the start or end of a stream.  An endpoint that receives a HEADERS
-%   frame without the END_STREAM flag set after receiving a final (non-
-%   informational) status code MUST treat the corresponding request or
-%   response as malformed (Section 8.1.2.6).
-%
+accept_trailers(Config) ->
+	doc("Trailing HEADERS frames must be accepted. (RFC7540 8.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a request containing DATA and trailing HEADERS frames.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:10000/unit:8>>),
+		cow_http2:headers(1, fin, TrailersBlock)
+	]),
+	%% Receive a HEADERS frame as a response.
+	{ok, << _:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	ok.
+
+accept_trailers_continuation(Config) ->
+	doc("Trailing HEADERS and CONTINUATION frames must be accepted. (RFC7540 8.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a request containing DATA and trailing HEADERS and CONTINUATION frames.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>}
+	], EncodeState),
+	Len = iolist_size(TrailersBlock),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:10000/unit:8>>),
+		<<0:24, 1:8, 0:7, 1:1, 0:1, 1:31>>,
+		<<Len:24, 9:8, 0:5, 1:1, 0:3, 1:31>>,
+		TrailersBlock
+	]),
+	%% Receive a HEADERS frame as a response.
+	{ok, << _:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	ok.
+
+%% We reject all invalid HEADERS with a connection error because
+%% we do not want to waste resources decoding them.
+reject_trailers_nofin(Config) ->
+	doc("Trailing HEADERS frames received without the END_STREAM flag "
+		"set must be rejected with a PROTOCOL_ERROR connection error. "
+		"(RFC7540 8.1, RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a request containing DATA and trailing HEADERS frames.
+	%% The trailing HEADERS does not have the END_STREAM flag set.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:10000/unit:8>>),
+		cow_http2:headers(1, nofin, TrailersBlock)
+	]),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+%% We reject all invalid HEADERS with a connection error because
+%% we do not want to waste resources decoding them.
+reject_trailers_nofin_continuation(Config) ->
+	doc("Trailing HEADERS frames received without the END_STREAM flag "
+		"set must be rejected with a PROTOCOL_ERROR connection error. "
+		"(RFC7540 8.1, RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a request containing DATA and trailing HEADERS and CONTINUATION frames.
+	%% The trailing HEADERS does not have the END_STREAM flag set.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>}
+	], EncodeState),
+	Len = iolist_size(TrailersBlock),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:10000/unit:8>>),
+		<<0:24, 1:8, 0:9, 1:31>>,
+		<<Len:24, 9:8, 0:5, 1:1, 0:3, 1:31>>,
+		TrailersBlock
+	]),
+	%% Receive a PROTOCOL_ERROR connection error.
+	{ok, << _:24, 7:8, _:72, 1:32 >>} = gen_tcp:recv(Socket, 17, 6000),
+	ok.
+
+headers_informational_nofin(Config) ->
+	doc("Informational HEADERS frames must not have the END_STREAM flag set. (RFC7540 8.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame on an idle stream.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/echo/read_body">>},
+		{<<"expect">>, <<"100-continue">>},
+		{<<"content-length">>, <<"1000000">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
+	%% Receive an informational HEADERS frame without the END_STREAM flag.
+	{ok, << Len:24, 1:8, 0:5, 1:1, 0:2, _:32 >>} = gen_tcp:recv(Socket, 9, 6000),
+	{ok, RespHeadersBlock} = gen_tcp:recv(Socket, Len, 6000),
+	%% Confirm it has a 100 status code.
+	{RespHeaders, _} = cow_hpack:decode(RespHeadersBlock),
+	{_, <<"100">>} = lists:keyfind(<<":status">>, 1, RespHeaders),
+	ok.
+
 %% @todo This one is interesting to implement because Cowboy DOES this.
 %   A server can
 %   send a complete response prior to the client sending an entire
@@ -2834,11 +3404,31 @@ reject_unknown_pseudo_headers(Config) ->
 	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
 	ok.
 
-%% @todo Implement request trailers. reject_pseudo_headers_in_trailers(Config) ->
-%   Pseudo-header fields MUST NOT appear in trailers.
-%   Endpoints MUST treat a request or response that contains
-%   undefined or invalid pseudo-header fields as malformed
-%   (Section 8.1.2.6).
+reject_pseudo_headers_in_trailers(Config) ->
+	doc("Requests containing pseudo-headers in trailers must be rejected "
+		"with a PROTOCOL_ERROR stream error. (RFC7540 8.1.2.1, RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a request containing DATA and trailing HEADERS frames.
+	%% The trailing HEADERS contains pseudo-headers.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>},
+		{<<":path">>, <<"/">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<0:10000/unit:8>>),
+		cow_http2:headers(1, fin, TrailersBlock)
+	]),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
 
 reject_pseudo_headers_after_regular_headers(Config) ->
 	doc("Requests containing pseudo-headers after regular headers must be rejected "
@@ -3053,7 +3643,7 @@ reject_missing_pseudo_header_method(Config) ->
 	{HeadersBlock, _} = cow_hpack:encode([
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3070,7 +3660,7 @@ reject_many_pseudo_header_method(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3085,7 +3675,7 @@ reject_missing_pseudo_header_scheme(Config) ->
 	{HeadersBlock, _} = cow_hpack:encode([
 		{<<":method">>, <<"GET">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3102,7 +3692,7 @@ reject_many_pseudo_header_scheme(Config) ->
 		{<<":scheme">>, <<"http">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3117,7 +3707,7 @@ reject_missing_pseudo_header_authority(Config) ->
 	{HeadersBlock, _} = cow_hpack:encode([
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3134,7 +3724,7 @@ reject_many_pseudo_header_authority(Config) ->
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3165,8 +3755,8 @@ reject_many_pseudo_header_path(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<>>},
-		{<<":path">>, <<>>}
+		{<<":path">>, <<"/">>},
+		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a PROTOCOL_ERROR stream error.
@@ -3188,15 +3778,115 @@ reject_many_pseudo_header_path(Config) ->
 %   before being passed into a non-HTTP/2 context, such as an HTTP/1.1
 %   connection, or a generic HTTP server application.
 
-%% (RFC7540 8.1.2.6)
-%   A request or response that includes a payload body can include a
-%   content-length header field.  A request or response is also malformed
-%   if the value of a content-length header field does not equal the sum
-%   of the DATA frame payload lengths that form the body.  A response
-%   that is defined to have no payload, as described in [RFC7230],
-%   Section 3.3.2, can have a non-zero content-length header field, even
-%   though no content is included in DATA frames.
-%
+reject_data_size_smaller_than_content_length(Config) ->
+	doc("Requests that have a content-length header whose value does not "
+		"match the total length of the DATA frames must be rejected with "
+		"a PROTOCOL_ERROR stream error. (RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with a content-length header different
+	%% than the sum of the DATA frame sizes.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"content-length">>, <<"12">>}
+	]),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, fin, <<"Hello!">>)
+	]),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+reject_data_size_larger_than_content_length(Config) ->
+	doc("Requests that have a content-length header whose value does not "
+		"match the total length of the DATA frames must be rejected with "
+		"a PROTOCOL_ERROR stream error. (RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with a content-length header different
+	%% than the sum of the DATA frame sizes.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"content-length">>, <<"12">>}
+	]),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<"Hello! World! Universe!">>),
+		cow_http2:data(1, fin, <<"Multiverse!">>)
+	]),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+reject_content_length_without_data(Config) ->
+	doc("Requests that have a content-length header whose value does not "
+		"match the total length of the DATA frames must be rejected with "
+		"a PROTOCOL_ERROR stream error. (RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with a content-length header different
+	%% than the sum of the DATA frame sizes.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"content-length">>, <<"12">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+reject_data_size_different_than_content_length_with_trailers(Config) ->
+	doc("Requests that have a content-length header whose value does not "
+		"match the total length of the DATA frames must be rejected with "
+		"a PROTOCOL_ERROR stream error. (RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with a content-length header different
+	%% than the sum of the DATA frame sizes.
+	{HeadersBlock, EncodeState} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/long_polling">>},
+		{<<"content-length">>, <<"12">>},
+		{<<"trailer">>, <<"x-checksum">>}
+	]),
+	{TrailersBlock, _} = cow_hpack:encode([
+		{<<"x-checksum">>, <<"md5:4cc909a007407f3706399b6496babec3">>}
+	], EncodeState),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, nofin, HeadersBlock),
+		cow_http2:data(1, nofin, <<"Hello!">>),
+		cow_http2:headers(1, fin, TrailersBlock)
+	]),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
+reject_duplicate_content_length_header(Config) ->
+	doc("A request with duplicate content-length headers must be rejected "
+		"with a PROTOCOL_ERROR stream error. (RFC7230 3.3.2, RFC7540 8.1.2.6)"),
+	{ok, Socket} = do_handshake(Config),
+	%% Send a HEADERS frame with more than one content-length header.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/">>},
+		{<<"content-length">>, <<"12">>},
+		{<<"content-length">>, <<"12">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
+	%% Receive a PROTOCOL_ERROR stream error.
+	{ok, << _:24, 3:8, _:8, 1:32, 1:32 >>} = gen_tcp:recv(Socket, 13, 6000),
+	ok.
+
 %   Intermediaries that process HTTP requests or responses (i.e., any
 %   intermediary not acting as a tunnel) MUST NOT forward a malformed
 %   request or response.  Malformed requests or responses that are

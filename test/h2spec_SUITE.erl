@@ -30,7 +30,8 @@ init_per_suite(Config) ->
 			skip;
 		_ ->
 			cowboy_test:init_http2(h2spec, #{
-				env => #{dispatch => init_dispatch()}
+				env => #{dispatch => init_dispatch()},
+				max_concurrent_streams => 100
 			}, Config)
 	end.
 
@@ -42,7 +43,7 @@ end_per_suite(_Config) ->
 init_dispatch() ->
 	cowboy_router:compile([
 		{'_', [
-			{"/", delay_hello_h, 500}
+			{"/", delay_hello_h, 50}
 		]}
 	]).
 

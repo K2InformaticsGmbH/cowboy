@@ -192,6 +192,7 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport, opts=Opts,
 			loop(State, Buffer);
 		%% System messages.
 		{'EXIT', Parent, Reason} ->
+			%% @todo We should exit gracefully, if possible.
 			exit(Reason);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [], {State, Buffer});
@@ -202,14 +203,8 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport, opts=Opts,
 		Msg = {'EXIT', Pid, _} ->
 			loop(down(State, Pid, Msg), Buffer);
 		%% Calls from supervisor module.
-		{'$gen_call', {From, Tag}, which_children} ->
-			From ! {Tag, cowboy_children:which_children(Children, ?MODULE)},
-			loop(State, Buffer);
-		{'$gen_call', {From, Tag}, count_children} ->
-			From ! {Tag, cowboy_children:count_children(Children)},
-			loop(State, Buffer);
-		{'$gen_call', {From, Tag}, _} ->
-			From ! {Tag, {error, ?MODULE}},
+		{'$gen_call', From, Call} ->
+			cowboy_children:handle_supervisor_call(Call, From, Children, ?MODULE),
 			loop(State, Buffer);
 		%% Unknown messages.
 		Msg ->
@@ -227,8 +222,10 @@ set_timeout(State0=#state{opts=Opts, streams=Streams}) ->
 		[] -> {request_timeout, 5000};
 		_ -> {idle_timeout, 60000}
 	end,
-	Timeout = maps:get(Name, Opts, Default),
-	TimerRef = erlang:start_timer(Timeout, self(), Name),
+	TimerRef = case maps:get(Name, Opts, Default) of
+		infinity -> undefined;
+		Timeout -> erlang:start_timer(Timeout, self(), Name)
+	end,
 	State#state{timer=TimerRef}.
 
 cancel_timeout(State=#state{timer=TimerRef}) ->
@@ -1007,7 +1004,7 @@ commands(State0=#state{ref=Ref, parent=Parent, socket=Socket, transport=Transpor
 	stream_call_terminate(StreamID, switch_protocol, StreamState),
 	%% Terminate children processes and flush any remaining messages from the mailbox.
 	cowboy_children:terminate(Children),
-	flush(),
+	flush(Parent),
 	%% @todo This is no good because commands return a state normally and here it doesn't
 	%% we need to let this module go entirely. Perhaps it should be handled directly in
 	%% cowboy_clear/cowboy_tls?
@@ -1033,8 +1030,19 @@ headers_to_list(Headers0=#{<<"set-cookie">> := SetCookies}) ->
 headers_to_list(Headers) ->
 	maps:to_list(Headers).
 
-flush() ->
-	receive _ -> flush() after 0 -> ok end.
+%% Flush messages specific to cowboy_http before handing over the
+%% connection to another protocol.
+flush(Parent) ->
+	receive
+		{timeout, _, _} ->
+			flush(Parent);
+		{{Pid, _}, _} when Pid =:= self() ->
+			flush(Parent);
+		{'EXIT', Pid, _} when Pid =/= Parent ->
+			flush(Parent)
+	after 0 ->
+		ok
+	end.
 
 %% @todo In these cases I'm not sure if we should continue processing commands.
 maybe_terminate(State=#state{last_streamid=StreamID}, StreamID, _Tail) ->
@@ -1230,6 +1238,7 @@ system_continue(_, _, {State, Buffer}) ->
 
 -spec system_terminate(any(), _, _, {#state{}, binary()}) -> no_return().
 system_terminate(Reason, _, _, {State, _}) ->
+	%% @todo We should exit gracefully, if possible.
 	terminate(State, Reason).
 
 -spec system_code_change(Misc, _, _, _) -> {ok, Misc} when Misc::{#state{}, binary()}.

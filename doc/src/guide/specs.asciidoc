@@ -30,6 +30,7 @@ for or related to HTTP.
 * http://www.w3.org/TR/eventsource/[eventsource]: Server-Sent Events
 * https://www.w3.org/TR/html4/interact/forms.html#h-17.13.4[Form content types]: Form content types
 * https://www.w3.org/TR/preload/[Preload]: Preload
+* https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt[PROXY]: The PROXY protocol
 * http://www.ics.uci.edu/~fielding/pubs/dissertation/rest_arch_style.htm[REST]: Fielding's Dissertation
 * https://tools.ietf.org/html/rfc1945[RFC 1945]: HTTP/1.0
 * https://tools.ietf.org/html/rfc1951[RFC 1951]: DEFLATE Compressed Data Format Specification version 1.3
@@ -86,6 +87,7 @@ for or related to HTTP.
 * https://tools.ietf.org/html/rfc8188[RFC 8188]: Encrypted Content-Encoding for HTTP
 * https://tools.ietf.org/html/rfc8246[RFC 8246]: HTTP Immutable Responses
 * https://tools.ietf.org/html/rfc8297[RFC 8297]: An HTTP Status Code for Indicating Hints
+* https://tools.ietf.org/html/rfc8336[RFC 8336]: The ORIGIN HTTP/2 Frame
 * https://www.w3.org/TR/webmention/[Webmention]: Webmention
 
 ==== Upcoming
@@ -188,3 +190,4 @@ for or related to HTTP.
 * https://tools.ietf.org/html/rfc7967[RFC 7967]: CoAP Option for No Server Response
 * https://tools.ietf.org/html/rfc8075[RFC 8075]: Guidelines for Mapping Implementations: HTTP to CoAP
 * https://tools.ietf.org/html/rfc8132[RFC 8132]: PATCH and FETCH Methods for CoAP
+* https://tools.ietf.org/html/rfc8323[RFC 8323]: CoAP over TCP, TLS, and WebSockets
