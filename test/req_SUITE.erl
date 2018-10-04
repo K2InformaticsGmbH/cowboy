@@ -77,7 +77,7 @@ do_body(Method, Path, Headers0, Body, Config) ->
 		<<>> -> gun:request(ConnPid, Method, Path, Headers);
 		_ -> gun:request(ConnPid, Method, Path, Headers, Body)
 	end,
-	{response, IsFin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	{response, IsFin, 200, RespHeaders} = gun:await(ConnPid, Ref, 10000),
 	{ok, RespBody} = case IsFin of
 		nofin -> gun:await_body(ConnPid, Ref);
 		fin -> {ok, <<>>}
@@ -144,6 +144,23 @@ do_decode(Headers, Body) ->
 	case lists:keyfind(<<"content-encoding">>, 1, Headers) of
 		{_, <<"gzip">>} -> zlib:gunzip(Body);
 		_ -> Body
+	end.
+
+do_get_error(Path, Config) ->
+	do_get_error(Path, [], Config).
+
+do_get_error(Path, Headers, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}|Headers]),
+	{response, IsFin, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	Result = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref);
+		fin -> {ok, <<>>}
+	end,
+	gun:close(ConnPid),
+	case Result of
+		{ok, RespBody} -> {Status, RespHeaders, do_decode(RespHeaders, RespBody)};
+		_ -> Result
 	end.
 
 %% Tests: Request.
@@ -334,6 +351,12 @@ port(Config) ->
 	Port = integer_to_binary(config(port, Config)),
 	Port = do_get_body("/port", Config),
 	Port = do_get_body("/direct/port", Config),
+	ExpectedPort = case config(type, Config) of
+		tcp -> <<"80">>;
+		ssl -> <<"443">>
+	end,
+	ExpectedPort = do_get_body("/port", [{<<"host">>, <<"localhost">>}], Config),
+	ExpectedPort = do_get_body("/direct/port", [{<<"host">>, <<"localhost">>}], Config),
 	ok.
 
 qs(Config) ->
@@ -426,28 +449,35 @@ read_body(Config) ->
 	<<"hello world!">> = do_body("POST", "/read_body", [], "hello world!", Config),
 	%% We expect to have read *at least* 1000 bytes.
 	<<0:8000, _/bits>> = do_body("POST", "/opts/read_body/length", [], <<0:8000000>>, Config),
-	%% We read any length for at most 1 second.
-	%%
-	%% The body is sent twice, first with nofin, then wait 2 seconds, then again with fin.
-	<<0:8000000>> = do_read_body_period("/opts/read_body/period", <<0:8000000>>, Config),
 	%% The timeout value is set too low on purpose to ensure a crash occurs.
 	ok = do_read_body_timeout("/opts/read_body/timeout", <<0:8000000>>, Config),
 	%% 10MB body larger than default length.
 	<<0:80000000>> = do_body("POST", "/full/read_body", [], <<0:80000000>>, Config),
 	ok.
 
-do_read_body_period(Path, Body, Config) ->
+read_body_mtu(Config) ->
+	doc("Request body whose sizes are around the MTU."),
+	MTU = ct_helper:get_loopback_mtu(),
+	_ = [begin
+		Body = <<0:Size/unit:8>>,
+		Body = do_body("POST", "/full/read_body", [], Body, Config)
+	end || Size <- lists:seq(MTU - 10, MTU + 10)],
+	ok.
+
+read_body_period(Config) ->
+	doc("Read the request body for at most 1 second."),
 	ConnPid = gun_open(Config),
-	Ref = gun:request(ConnPid, "POST", Path, [
+	Body = <<0:8000000>>,
+	Ref = gun:request(ConnPid, "POST", "/opts/read_body/period", [
 		{<<"content-length">>, integer_to_binary(byte_size(Body) * 2)}
 	]),
+	%% The body is sent twice, first with nofin, then wait 2 seconds, then again with fin.
 	gun:data(ConnPid, Ref, nofin, Body),
 	timer:sleep(2000),
 	gun:data(ConnPid, Ref, fin, Body),
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
-	{ok, RespBody} = gun:await_body(ConnPid, Ref),
-	gun:close(ConnPid),
-	RespBody.
+	{ok, Body} = gun:await_body(ConnPid, Ref),
+	gun:close(ConnPid).
 
 %% We expect a crash.
 do_read_body_timeout(Path, Body, Config) ->
@@ -533,6 +563,33 @@ do_read_urlencoded_body_too_long(Path, Body, Config) ->
 			ok
 	end,
 	gun:close(ConnPid).
+
+read_and_match_urlencoded_body(Config) ->
+	doc("Read and match an application/x-www-form-urlencoded request body."),
+	<<"#{}">> = do_body("POST", "/match/body_qs", [], "a=b&c=d", Config),
+	<<"#{a => <<\"b\">>}">> = do_body("POST", "/match/body_qs/a", [], "a=b&c=d", Config),
+	<<"#{c => <<\"d\">>}">> = do_body("POST", "/match/body_qs/c", [], "a=b&c=d", Config),
+	<<"#{a => <<\"b\">>,c => <<\"d\">>}">>
+		= do_body("POST", "/match/body_qs/a/c", [], "a=b&c=d", Config),
+	<<"#{a => <<\"b\">>,c => true}">> = do_body("POST", "/match/body_qs/a/c", [], "a=b&c", Config),
+	<<"#{a => true,c => <<\"d\">>}">> = do_body("POST", "/match/body_qs/a/c", [], "a&c=d", Config),
+	%% Ensure match errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/match/body_qs/a/c", [], "a=b", Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/match/body_qs", [], "%%%%%", Config),
+	%% Send a 10MB body, larger than the default length, to ensure a crash occurs.
+	ok = do_read_urlencoded_body_too_large(
+		"/no-opts/read_and_match_urlencoded_body",
+		string:chars($a, 10000000), Config),
+	%% We read any length for at most 1 second.
+	%%
+	%% The body is sent twice, first with nofin, then wait 1.1 second, then again with fin.
+	%% We expect the handler to crash because read_and_match_urlencoded_body expects the full body.
+	ok = do_read_urlencoded_body_too_long(
+		"/crash/read_and_match_urlencoded_body/period", <<"abc">>, Config),
+	%% The timeout value is set too low on purpose to ensure a crash occurs.
+	ok = do_read_body_timeout("/opts/read_and_match_urlencoded_body/timeout", <<"abc">>, Config),
+	ok.
 
 multipart(Config) ->
 	doc("Multipart request body."),
@@ -843,9 +900,90 @@ stream_body_nofin(Config) ->
 	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/nofin", Config),
 	ok.
 
+stream_body_content_length_multiple(Config) ->
+	doc("Streamed body via multiple calls."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body_content_length/multiple", Config),
+	ok.
+
+stream_body_content_length_fin0(Config) ->
+	doc("Streamed body with last chunk of size 0."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body_content_length/fin0", Config),
+	ok.
+
+stream_body_content_length_nofin(Config) ->
+	doc("Unfinished streamed body."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body_content_length/nofin", Config),
+	ok.
+
+stream_body_content_length_nofin_error(Config) ->
+	doc("Not all of body sent."),
+	case config(protocol, Config) of
+		http ->
+			case do_get_error("/resp/stream_body_content_length/nofin-error", Config) of
+				{200, Headers, <<"Hello">>} ->
+					{_, <<"gzip">>} = lists:keyfind(<<"content-encoding">>, 1, Headers);
+				{error, {closed, "The connection was lost."}} ->
+					ok;
+				{error, timeout} ->
+					ok
+			end;
+		http2 ->
+			%% @todo HTTP2 should have the same content-length checks
+			ok
+	end.
+
 %% @todo Crash when calling stream_body after the fin flag has been set.
 %% @todo Crash when calling stream_body after calling reply.
 %% @todo Crash when calling stream_body before calling stream_reply.
+
+stream_events_single(Config) ->
+	doc("Streamed event."),
+	{200, Headers, <<
+		"event: add_comment\n"
+		"data: Comment text.\n"
+		"data: With many lines.\n"
+		"\n"
+	>>} = do_get("/resp/stream_events/single", Config),
+	{_, <<"text/event-stream">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	ok.
+
+stream_events_list(Config) ->
+	doc("Streamed list of events."),
+	{200, Headers, <<
+		"event: add_comment\n"
+		"data: Comment text.\n"
+		"data: With many lines.\n"
+		"\n"
+		": Set retry higher\n"
+		": with many lines also.\n"
+		"retry: 10000\n"
+		"\n"
+		"id: 123\n"
+		"event: add_comment\n"
+		"data: Closing!\n"
+		"\n"
+	>>} = do_get("/resp/stream_events/list", Config),
+	{_, <<"text/event-stream">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	ok.
+
+stream_events_multiple(Config) ->
+	doc("Streamed events via multiple calls."),
+	{200, Headers, <<
+		"event: add_comment\n"
+		"data: Comment text.\n"
+		"data: With many lines.\n"
+		"\n"
+		": Set retry higher\n"
+		": with many lines also.\n"
+		"retry: 10000\n"
+		"\n"
+		"id: 123\n"
+		"event: add_comment\n"
+		"data: Closing!\n"
+		"\n"
+	>>} = do_get("/resp/stream_events/multiple", Config),
+	{_, <<"text/event-stream">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	ok.
 
 stream_trailers(Config) ->
 	doc("Stream body followed by trailer headers."),

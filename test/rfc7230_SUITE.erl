@@ -17,7 +17,9 @@
 -compile(nowarn_export_all).
 
 -import(ct_helper, [doc/1]).
+-import(ct_helper, [name/0]).
 -import(cowboy_test, [gun_open/1]).
+-import(cowboy_test, [gun_down/1]).
 -import(cowboy_test, [raw_open/1]).
 -import(cowboy_test, [raw_send/2]).
 -import(cowboy_test, [raw_recv_head/1]).
@@ -148,8 +150,29 @@ timeout_after_request_line(Config) ->
 	doc("The time the request (request line and headers) takes to be "
 		"received by the server must be limited and subject to configuration. "
 		"A 408 status code must be sent if the request line was received."),
-	#{code := 408, client := Client} = do_raw(Config, "GET / HTTP/1.1\r\n"),
-	{error, closed} = raw_recv(Client, 0, 6000).
+	#{code := 408, client := Client1} = do_raw(Config, "GET / HTTP/1.1\r\n"),
+	{error, closed} = raw_recv(Client1, 0, 6000).
+
+timeout_after_request_line_host(Config) ->
+	doc("The time the request (request line and headers) takes to be "
+		"received by the server must be limited and subject to configuration. "
+		"A 408 status code must be sent if the request line was received."),
+	#{code := 408, client := Client2} = do_raw(Config, "GET / HTTP/1.1\r\nHost: localhost"),
+	{error, closed} = raw_recv(Client2, 0, 6000).
+
+timeout_after_request_line_host_crlf(Config) ->
+	doc("The time the request (request line and headers) takes to be "
+		"received by the server must be limited and subject to configuration. "
+		"A 408 status code must be sent if the request line was received."),
+	#{code := 408, client := Client3} = do_raw(Config, "GET / HTTP/1.1\r\nHost: localhost\r\n"),
+	{error, closed} = raw_recv(Client3, 0, 6000).
+
+timeout_after_request_line_host_crlfcr(Config) ->
+	doc("The time the request (request line and headers) takes to be "
+		"received by the server must be limited and subject to configuration. "
+		"A 408 status code must be sent if the request line was received."),
+	#{code := 408, client := Client4} = do_raw(Config, "GET / HTTP/1.1\r\nHost: localhost\r\n\r"),
+	{error, closed} = raw_recv(Client4, 0, 6000).
 
 %% @todo Add an HTTP/1.0 test suite.
 %An HTTP/1.1 server must understand any valid HTTP/1.0 request,
@@ -267,15 +290,16 @@ must_understand_origin_form(Config) ->
 		"Host: localhost\r\n"
 		"\r\n").
 
-origin_form_reject_if_connect(Config) ->
-	doc("origin-form is used when the client does not connect to a proxy, "
-		"does not use the CONNECT method and does not issue a site-wide "
-		"OPTIONS request. (RFC7230 5.3.1)"),
-	#{code := 400, client := Client} = do_raw(Config,
-		"CONNECT / HTTP/1.1\r\n"
-		"Host: localhost\r\n"
-		"\r\n"),
-	{error, closed} = raw_recv(Client, 0, 1000).
+%% @todo Reenable this test once support for CONNECT is added.
+%origin_form_reject_if_connect(Config) ->
+%	doc("origin-form is used when the client does not connect to a proxy, "
+%		"does not use the CONNECT method and does not issue a site-wide "
+%		"OPTIONS request. (RFC7230 5.3.1)"),
+%	#{code := 400, client := Client} = do_raw(Config,
+%		"CONNECT / HTTP/1.1\r\n"
+%		"Host: localhost\r\n"
+%		"\r\n"),
+%	{error, closed} = raw_recv(Client, 0, 1000).
 
 %% @todo Equivalent test for https.
 origin_form_tcp_scheme(Config) ->
@@ -354,7 +378,7 @@ absolute_form_case_insensitive_host(Config) ->
 	Echo = <<"http://localhost/echo/uri">>,
 	#{code := 200, body := Echo} = do_raw(Config,
 		"GET http://LoCaLHOsT/echo/uri HTTP/1.1\r\n"
-		"Host: localhost\r\n"
+		"Host: LoCaLHOsT\r\n"
 		"\r\n").
 
 absolute_form_reject_unknown_schemes(Config) ->
@@ -471,7 +495,8 @@ absolute_form_invalid_port_0(Config) ->
 	{error, closed} = raw_recv(Client, 0, 1000).
 
 absolute_form_invalid_port_65536(Config) ->
-	doc("Port numbers above 65535 are invalid. The request must be rejected and the connection closed."),
+	doc("Port numbers above 65535 are invalid. The request must be rejected "
+		"and the connection closed."),
 	#{code := 400, client := Client} = do_raw(Config,
 		"GET http://localhost:65536/ HTTP/1.1\r\n"
 		"Host: localhost:65536\r\n"
@@ -1405,7 +1430,7 @@ limit_requests_keepalive(Config) ->
 	{response, nofin, 200, RespHeaders} = gun:await(ConnPid, Ref),
 	{ok, <<"Hello world!">>} = gun:await_body(ConnPid, Ref),
 	{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, RespHeaders),
-	ok.
+	gun_down(ConnPid).
 
 %skip_request_body_by_closing_connection(Config) ->
 %%A server that doesn't want to read the entire body of a message
@@ -1481,7 +1506,8 @@ ignore_requests_after_response_connection_close(Config) ->
 	doc("The server must not process any request after "
 		"sending the \"close\" connection option. (RFC7230 6.6)"),
 	Self = self(),
-	#{code := 200} = do_raw(Config, [
+	Client = raw_open(Config),
+	ok = raw_send(Client, [
 		[
 			"GET / HTTP/1.1\r\n"
 			"Host: localhost\r\n"
@@ -1562,8 +1588,21 @@ reject_absolute_form_different_host(Config) ->
 %identical to the host header. Invalid requests must be rejected
 %with a 400 status code and the closing of the connection.
 
-%empty_host(Config) ->
-%The host header is empty when the authority component is undefined. (RFC7230 5.4)
+empty_host(Config0) ->
+	doc("The host header is empty when the authority component is undefined. (RFC7230 5.4)"),
+	Routes = [{'_', [{"/echo/:key[/:arg]", echo_h, []}]}],
+	Config = cowboy_test:init_http(name(), #{
+		env => #{dispatch => cowboy_router:compile(Routes)}
+	}, Config0),
+	#{code := 200, body := <<>>} = do_raw(Config, [
+		"GET /echo/host HTTP/1.1\r\n"
+		"Host:\r\n"
+		"\r\n"]),
+	#{code := 200, body := <<>>} = do_raw(Config, [
+		"GET /echo/host HTTP/1.1\r\n"
+		"Host: \r\n"
+		"\r\n"]),
+	cowboy:stop_listener(name()).
 
 %% The effective request URI can be rebuilt by concatenating scheme,
 %% "://", authority, path and query components. (RFC7230 5.5)
@@ -1887,7 +1926,7 @@ te_trailers(Config) ->
 	#{code := 200, headers := RespHeaders} = do_raw(Config, [
 		"GET /resp/stream_trailers HTTP/1.1\r\n"
 		"Host: localhost\r\n"
-		"TE: trailer\r\n"
+		"TE: trailers\r\n"
 		"\r\n"]),
 	{_, <<"chunked">>} = lists:keyfind(<<"transfer-encoding">>, 1, RespHeaders),
 	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),

@@ -15,6 +15,10 @@
 
 -module(cowboy_req).
 
+-ifdef(OTP_RELEASE).
+-compile({nowarn_deprecated_function, [{erlang, get_stacktrace, 0}]}).
+-endif.
+
 %% Request.
 -export([method/1]).
 -export([version/1]).
@@ -50,7 +54,8 @@
 -export([read_body/2]).
 -export([read_urlencoded_body/1]).
 -export([read_urlencoded_body/2]).
-%% @todo read_and_match_urlencoded_body?
+-export([read_and_match_urlencoded_body/2]).
+-export([read_and_match_urlencoded_body/3]).
 
 %% Multipart.
 -export([read_part/1]).
@@ -80,7 +85,8 @@
 -export([stream_reply/3]).
 %% @todo stream_body/2 (nofin)
 -export([stream_body/3]).
-%% @todo stream_event/2,3
+%% @todo stream_events/2 (nofin)
+-export([stream_events/3]).
 -export([stream_trailers/2]).
 -export([push/3]).
 -export([push/4]).
@@ -110,7 +116,7 @@
 	method => binary(),
 	scheme => binary(),
 	host => binary(),
-	port => binary(),
+	port => inet:port_number(),
 	qs => binary()
 }.
 -export_type([push_opts/0]).
@@ -508,6 +514,23 @@ read_urlencoded_body(Req0, Opts) ->
 			end
 	end.
 
+-spec read_and_match_urlencoded_body(cowboy:fields(), Req)
+	-> {ok, map(), Req} when Req::req().
+read_and_match_urlencoded_body(Fields, Req) ->
+	read_and_match_urlencoded_body(Fields, Req, #{length => 64000, period => 5000}).
+
+-spec read_and_match_urlencoded_body(cowboy:fields(), Req, read_body_opts())
+	-> {ok, map(), Req} when Req::req().
+read_and_match_urlencoded_body(Fields, Req0, Opts) ->
+	{ok, Qs, Req} = read_urlencoded_body(Req0, Opts),
+	case filter(Fields, kvlist_to_map(Fields, Qs)) of
+		{ok, Map} ->
+			{ok, Map, Req};
+		{error, Errors} ->
+			exit({request_error, {read_and_match_urlencoded_body, Errors},
+				'Urlencoded request body validation constraints failed for the reasons provided.'})
+	end.
+
 %% Multipart.
 
 -spec read_part(Req)
@@ -784,6 +807,13 @@ stream_body(Data, IsFin=nofin, #{pid := Pid, streamid := StreamID, has_sent_resp
 	end;
 stream_body(Data, IsFin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
 	Pid ! {{Pid, StreamID}, {data, IsFin, Data}},
+	ok.
+
+-spec stream_events(cow_sse:event() | [cow_sse:event()], fin | nofin, req()) -> ok.
+stream_events(Event, IsFin, Req) when is_map(Event) ->
+	stream_events([Event], IsFin, Req);
+stream_events(Events, IsFin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
+	Pid ! {{Pid, StreamID}, {data, IsFin, cow_sse:events(Events)}},
 	ok.
 
 -spec stream_trailers(cowboy:http_headers(), req()) -> ok.

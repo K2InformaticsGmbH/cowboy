@@ -33,39 +33,16 @@ all() ->
 		{group, http},
 		{group, https},
 		{group, http_compress},
-		{group, https_compress},
-		{group, parse_host},
-		{group, request_timeout_infinity},
-		{group, idle_timeout_infinity},
-		{group, set_env},
-		{group, router_compile}
+		{group, https_compress}
 	].
 
 groups() ->
-	Tests = ct_helper:all(?MODULE) -- [
-		parse_host, set_env_dispatch, path_allow_colon,
-		request_timeout_infinity, idle_timeout_infinity
-	],
+	Tests = ct_helper:all(?MODULE),
 	[
 		{http, [], Tests}, %% @todo parallel
 		{https, [parallel], Tests},
 		{http_compress, [parallel], Tests},
-		{https_compress, [parallel], Tests},
-		{parse_host, [], [
-			parse_host
-		]},
-		{request_timeout_infinity, [], [
-			request_timeout_infinity
-		]},
-		{idle_timeout_infinity, [], [
-			idle_timeout_infinity
-		]},
-		{set_env, [], [
-			set_env_dispatch
-		]},
-		{router_compile, [], [
-			path_allow_colon
-		]}
+		{https_compress, [parallel], Tests}
 	].
 
 init_per_group(Name = http, Config) ->
@@ -81,45 +58,8 @@ init_per_group(Name = https_compress, Config) ->
 	cowboy_test:init_https(Name, #{
 		env => #{dispatch => init_dispatch(Config)},
 		compress => true
-	}, Config);
-init_per_group(parse_host, Config) ->
-	Dispatch = cowboy_router:compile([
-		{'_', [
-			{"/req_attr", http_req_attr, []}
-		]}
-	]),
-	{ok, _} = cowboy:start_clear(parse_host, [{port, 0}], #{
-		env => #{dispatch => Dispatch}
-	}),
-	Port = ranch:get_port(parse_host),
-	[{type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config];
-init_per_group(request_timeout_infinity, Config) ->
-	Ref = request_timeout_infinity,
-	{ok, Pid} = cowboy:start_clear(Ref, [{port, 0}], #{
-		env => #{dispatch => init_dispatch(Config)},
-		request_timeout => infinity
-	}),
-	Port = ranch:get_port(request_timeout_infinity),
-	[{pid, Pid}, {ref, Ref}, {type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config];
-init_per_group(idle_timeout_infinity, Config) ->
-	Ref = idle_timeout_infinity,
-	{ok, Pid} = cowboy:start_clear(Ref, [{port, 0}], #{
-		env => #{dispatch => init_dispatch(Config)},
-		idle_timeout => infinity
-	}),
-	Port = ranch:get_port(idle_timeout_infinity),
-	[{pid, Pid}, {ref, Ref}, {type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config];
-init_per_group(set_env, Config) ->
-	{ok, _} = cowboy:start_clear(set_env, [{port, 0}], #{
-		env => #{dispatch => []}
-	}),
-	Port = ranch:get_port(set_env),
-	[{type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config];
-init_per_group(router_compile, Config) ->
-	Config.
+	}, Config).
 
-end_per_group(router_compile, _) ->
-	ok;
 end_per_group(Name, _) ->
 	ok = cowboy:stop_listener(Name).
 
@@ -183,49 +123,17 @@ check_raw_status(Config) ->
 	Huge = [$0 || _ <- lists:seq(1, 5000)],
 	HugeCookie = lists:flatten(["whatever_man_biiiiiiiiiiiig_cookie_me_want_77="
 		"Wed Apr 06 2011 10:38:52 GMT-0500 (CDT)" || _ <- lists:seq(1, 40)]),
-	ResponsePacket =
-"HTTP/1.0 302 Found\r
-Location: http://www.google.co.il/\r
-Cache-Control: private\r
-Content-Type: text/html; charset=UTF-8\r
-Set-Cookie: PREF=ID=568f67013d4a7afa:FF=0:TM=1323014101:LM=1323014101:S=XqctDWC65MzKT0zC; expires=Tue, 03-Dec-2013 15:55:01 GMT; path=/; domain=.google.com\r
-Date: Sun, 04 Dec 2011 15:55:01 GMT\r
-Server: gws\r
-Content-Length: 221\r
-X-XSS-Protection: 1; mode=block\r
-X-Frame-Options: SAMEORIGIN\r
-\r
-<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">
-<TITLE>302 Moved</TITLE></HEAD><BODY>
-<H1>302 Moved</H1>
-The document has moved
-<A HREF=\"http://www.google.co.il/\">here</A>.
-</BODY></HTML>",
 	Tests = [
 		{200, ["GET / HTTP/1.0\r\nHost: localhost\r\n"
 			"Set-Cookie: ", HugeCookie, "\r\n\r\n"]},
 		{200, "\r\n\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n"},
-		{200, "GET http://proxy/ HTTP/1.1\r\nHost: localhost\r\n\r\n"},
 		{400, "\n"},
 		{400, "Garbage\r\n\r\n"},
 		{400, "\r\n\r\n\r\n\r\n\r\n\r\n"},
-		{400, " / HTTP/1.1\r\nHost: localhost\r\n\r\n"},
 		{400, "GET  HTTP/1.1\r\nHost: localhost\r\n\r\n"},
 		{400, "GET / HTTP/1.1\r\nHost: ninenines.eu\r\n\r\n"},
-		{400, "GET http://proxy/ HTTP/1.1\r\n\r\n"},
 		{400, "GET / HTTP/1.1\r\nHost: localhost:bad_port\r\n\r\n"},
-		{400, ResponsePacket},
-		{408, "GET / HTTP/1.1\r\n"},
-		{408, "GET / HTTP/1.1\r\nHost: localhost"},
-		{408, "GET / HTTP/1.1\r\nHost: localhost\r\n"},
-		{408, "GET / HTTP/1.1\r\nHost: localhost\r\n\r"},
-		{closed, Huge},
-		{431, "GET / HTTP/1.1\r\n" ++ Huge},
-		{505, "GET / HTTP/1.2\r\nHost: localhost\r\n\r\n"},
-		{closed, ""},
-		{closed, "\r\n"},
-		{closed, "\r\n\r\n"},
-		{closed, "GET / HTTP/1.1"}
+		{closed, Huge}
 	],
 	_ = [{Status, Packet} = begin
 		Ret = do_raw(Packet, Config),
@@ -235,7 +143,6 @@ The document has moved
 
 check_status(Config) ->
 	Tests = [
-		{200, "/"},
 		{200, "/simple"},
 		{404, "/not/found"},
 		{500, "/handler_errors?case=init_before_reply"}
@@ -244,25 +151,6 @@ check_status(Config) ->
 		Ret = do_get(URL, Config),
 		{Ret, URL}
 	end || {Status, URL} <- Tests].
-
-%% Check if sending requests whose size is around the MTU breaks something.
-echo_body(Config) ->
-	MTU = ct_helper:get_loopback_mtu(),
-	_ = [begin
-		Body = list_to_binary(lists:duplicate(Size, $a)),
-		ConnPid = gun_open(Config),
-		Ref = gun:post(ConnPid, "/echo/body", [], Body),
-		{response, nofin, 200, _} = gun:await(ConnPid, Ref),
-		{ok, Body} = gun:await_body(ConnPid, Ref)
-	end || Size <- lists:seq(MTU - 500, MTU)],
-	ok.
-
-%% Check if sending request whose size is bigger than 1000000 bytes causes 413
-echo_body_max_length(Config) ->
-	ConnPid = gun_open(Config),
-	Ref = gun:post(ConnPid, "/echo/body", [], << 0:10000000/unit:8 >>),
-	{response, nofin, 413, _} = gun:await(ConnPid, Ref),
-	ok.
 
 error_init_after_reply(Config) ->
 	ConnPid = gun_open(Config),
@@ -345,7 +233,7 @@ keepalive_nl(Config) ->
 	ConnPid = gun_open(Config),
 	Refs = [begin
 		Ref = gun:get(ConnPid, "/", [{<<"connection">>, <<"keep-alive">>}]),
-		gun:dbg_send_raw(ConnPid, <<"\r\n">>),
+		dbg_send_raw(ConnPid, <<"\r\n">>),
 		Ref
 	end || _ <- lists:seq(1, 10)],
 	_ = [begin
@@ -390,26 +278,6 @@ nc_rand(Config) ->
 
 nc_zero(Config) ->
 	do_nc(Config, "/dev/zero").
-
-parse_host(Config) ->
-	ConnPid = gun_open(Config),
-	Tests = [
-		{<<"example.org:8080">>, <<"example.org\n8080">>},
-		{<<"example.org">>, <<"example.org\n80">>},
-		{<<"192.0.2.1:8080">>, <<"192.0.2.1\n8080">>},
-		{<<"192.0.2.1">>, <<"192.0.2.1\n80">>},
-		{<<"[2001:db8::1]:8080">>, <<"[2001:db8::1]\n8080">>},
-		{<<"[2001:db8::1]">>, <<"[2001:db8::1]\n80">>},
-		{<<"[::ffff:192.0.2.1]:8080">>, <<"[::ffff:192.0.2.1]\n8080">>},
-		{<<"[::ffff:192.0.2.1]">>, <<"[::ffff:192.0.2.1]\n80">>}
-	],
-	[begin
-		Ref = gun:get(ConnPid, "/req_attr?attr=host_and_port",
-			[{<<"host">>, Host}]),
-		{response, nofin, 200, _} = gun:await(ConnPid, Ref),
-		{ok, Body} = gun:await_body(ConnPid, Ref)
-	end || {Host, Body} <- Tests],
-	ok.
 
 rest_param_all(Config) ->
 	ConnPid = gun_open(Config),
@@ -610,37 +478,6 @@ rest_resource_etags_if_none_match(Config) ->
 		{Ret, Type}
 	end || {Status, ETag, Type} <- Tests].
 
-set_env_dispatch(Config) ->
-	ConnPid1 = gun_open(Config),
-	Ref1 = gun:get(ConnPid1, "/"),
-	{response, fin, 400, _} = gun:await(ConnPid1, Ref1),
-	ok = cowboy:set_env(set_env, dispatch,
-		cowboy_router:compile([{'_', [{"/", http_handler, []}]}])),
-	ConnPid2 = gun_open(Config),
-	Ref2 = gun:get(ConnPid2, "/"),
-	{response, nofin, 200, _} = gun:await(ConnPid2, Ref2),
-	ok.
-
-path_allow_colon(_Config) ->
-	cowboy_router:compile([{'_', [{"/foo/bar:blah", http_handler, []}]}]),
-	ok.
-
-set_resp_body(Config) ->
-	ConnPid = gun_open(Config),
-	Ref = gun:get(ConnPid, "/set_resp/body"),
-	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
-	{ok, <<"A flameless dance does not equal a cycle">>}
-		= gun:await_body(ConnPid, Ref),
-	ok.
-
-set_resp_header(Config) ->
-	ConnPid = gun_open(Config),
-	Ref = gun:get(ConnPid, "/set_resp/header"),
-	{response, nofin, 200, Headers} = gun:await(ConnPid, Ref),
-	{_, <<"Accept">>} = lists:keyfind(<<"vary">>, 1, Headers),
-	{_, _} = lists:keyfind(<<"set-cookie">>, 1, Headers),
-	ok.
-
 set_resp_overwrite(Config) ->
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/set_resp/overwrite"),
@@ -701,7 +538,7 @@ te_chunked_chopped(Config) ->
 	Ref = gun:post(ConnPid, "/echo/body",
 		[{<<"content-type">>, <<"text/plain">>}]),
 	_ = [begin
-		ok = gun:dbg_send_raw(ConnPid, << C >>),
+		ok = dbg_send_raw(ConnPid, << C >>),
 		receive after 10 -> ok end
 	end || << C >> <= Body2],
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
@@ -715,7 +552,7 @@ te_chunked_delayed(Config) ->
 	Ref = gun:post(ConnPid, "/echo/body",
 		[{<<"content-type">>, <<"text/plain">>}]),
 	_ = [begin
-		ok = gun:dbg_send_raw(ConnPid, Chunk),
+		ok = dbg_send_raw(ConnPid, Chunk),
 		receive after 10 -> ok end
 	end || Chunk <- Chunks],
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
@@ -731,15 +568,15 @@ te_chunked_split_body(Config) ->
 	_ = [begin
 		case Chunk of
 			<<"0\r\n\r\n">> ->
-				ok = gun:dbg_send_raw(ConnPid, Chunk);
+				ok = dbg_send_raw(ConnPid, Chunk);
 			_ ->
 				[Size, ChunkBody, <<>>] =
 					binary:split(Chunk, [<<"\r\n">>], [global]),
 				PartASize = random:uniform(byte_size(ChunkBody)),
 				<<PartA:PartASize/binary, PartB/binary>> = ChunkBody,
-				ok = gun:dbg_send_raw(ConnPid, [Size, <<"\r\n">>, PartA]),
+				ok = dbg_send_raw(ConnPid, [Size, <<"\r\n">>, PartA]),
 				receive after 10 -> ok end,
-				ok = gun:dbg_send_raw(ConnPid, [PartB, <<"\r\n">>])
+				ok = dbg_send_raw(ConnPid, [PartB, <<"\r\n">>])
 		end
 	end || Chunk <- Chunks],
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
@@ -756,9 +593,9 @@ te_chunked_split_crlf(Config) ->
 		%% Split in the newline just before the end of the chunk.
 		Len = byte_size(Chunk) - (random:uniform(2) - 1),
 		<< Chunk2:Len/binary, End/binary >> = Chunk,
-		ok = gun:dbg_send_raw(ConnPid, Chunk2),
+		ok = dbg_send_raw(ConnPid, Chunk2),
 		receive after 10 -> ok end,
-		ok = gun:dbg_send_raw(ConnPid, End)
+		ok = dbg_send_raw(ConnPid, End)
 	end || Chunk <- Chunks],
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
 	{ok, Body} = gun:await_body(ConnPid, Ref),
@@ -772,25 +609,13 @@ te_identity(Config) ->
 	{ok, Body} = gun:await_body(ConnPid, Ref),
 	ok.
 
-request_timeout_infinity(Config) ->
-	Pid = config(pid, Config),
-	Ref = erlang:monitor(process, Pid),
-	_ = gun_open(Config),
-	receive
-		{'DOWN', Ref, process, Pid, Reason} ->
-			error(Reason)
-	after 1000 ->
-		ok
-	end.
-
-idle_timeout_infinity(Config) ->
-	Pid = config(pid, Config),
-	Ref = erlang:monitor(process, Pid),
-	ConnPid = gun_open(Config),
-	gun:post(ConnPid, "/echo/body", [], <<"TEST">>),
-	receive
-		{'DOWN', Ref, process, Pid, Reason} ->
-			error(Reason)
-	after 1000 ->
-		ok
-	end.
+dbg_send_raw(ConnPid, Data) ->
+	#{
+		socket := Socket,
+		transport := Transport
+	} = gun:info(ConnPid),
+	_ = case Transport of
+		tcp -> gen_tcp:send(Socket, Data);
+		tls -> ssl:send(Socket, Data)
+	end,
+	ok.

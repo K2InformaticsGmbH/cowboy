@@ -18,6 +18,8 @@
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
+-import(ct_helper, [get_remote_pid_tcp/1]).
+-import(ct_helper, [name/0]).
 -import(cowboy_test, [gun_open/1]).
 
 all() -> [{group, clear}].
@@ -26,9 +28,47 @@ groups() -> [{clear, [parallel], ct_helper:all(?MODULE)}].
 
 init_routes(_) -> [
 	{"localhost", [
-		{"/", hello_h, []}
+		{"/", hello_h, []},
+		{"/echo/:key", echo_h, []}
 	]}
 ].
+
+idle_timeout_infinity(Config) ->
+	doc("Ensure the idle_timeout option accepts the infinity value."),
+	{ok, _} = cowboy:start_clear(name(), [{port, 0}], #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config))},
+		request_timeout => infinity
+	}),
+	Port = ranch:get_port(name()),
+	ConnPid = gun_open([{type, tcp}, {protocol, http}, {port, Port}|Config]),
+	_ = gun:post(ConnPid, "/echo/read_body", [], <<"TEST">>),
+	#{socket := Socket} = gun:info(ConnPid),
+	Pid = get_remote_pid_tcp(Socket),
+	Ref = erlang:monitor(process, Pid),
+	receive
+		{'DOWN', Ref, process, Pid, Reason} ->
+			error(Reason)
+	after 1000 ->
+		ok
+	end.
+
+request_timeout_infinity(Config) ->
+	doc("Ensure the request_timeout option accepts the infinity value."),
+	{ok, _} = cowboy:start_clear(name(), [{port, 0}], #{
+		env => #{dispatch => cowboy_router:compile(init_routes(Config))},
+		idle_timeout => infinity
+	}),
+	Port = ranch:get_port(name()),
+	ConnPid = gun_open([{type, tcp}, {protocol, http}, {port, Port}|Config]),
+	#{socket := Socket} = gun:info(ConnPid),
+	Pid = get_remote_pid_tcp(Socket),
+	Ref = erlang:monitor(process, Pid),
+	receive
+		{'DOWN', Ref, process, Pid, Reason} ->
+			error(Reason)
+	after 1000 ->
+		ok
+	end.
 
 switch_protocol_flush(Config) ->
 	doc("Confirm that switch_protocol does not flush unrelated messages."),

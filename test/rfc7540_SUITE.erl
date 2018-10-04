@@ -34,11 +34,11 @@ groups() ->
 	[{clear, [parallel], Clear}, {tls, [parallel], TLS}].
 
 init_per_group(Name = clear, Config) ->
-	cowboy_test:init_http(Name = clear, #{
+	cowboy_test:init_http(Name, #{
 		env => #{dispatch => cowboy_router:compile(init_routes(Config))}
 	}, Config);
 init_per_group(Name = tls, Config) ->
-	cowboy_test:init_http2(Name = tls, #{
+	cowboy_test:init_http2(Name, #{
 		env => #{dispatch => cowboy_router:compile(init_routes(Config))}
 	}, Config).
 
@@ -1348,7 +1348,7 @@ max_frame_size_allow_exactly_custom(Config0) ->
 	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
 	%% No errors follow due to our sending of a 25000 bytes frame.
 	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
-	ok.
+	cowboy:stop_listener(name()).
 
 max_frame_size_reject_larger_than_custom(Config0) ->
 	doc("An endpoint that sets SETTINGS_MAX_FRAME_SIZE must reject frames "
@@ -1375,7 +1375,7 @@ max_frame_size_reject_larger_than_custom(Config0) ->
 	]),
 	%% Receive a FRAME_SIZE_ERROR connection error.
 	{ok, << _:24, 7:8, _:72, 6:32 >>} = gen_tcp:recv(Socket, 17, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 %% I am using FRAME_SIZE_ERROR here because the information in the
 %% frame header tells us this frame is at least 1 byte long, while
@@ -1839,7 +1839,7 @@ half_closed_remote_reject_data(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Send a DATA frame on that now half-closed (remote) stream.
@@ -1859,7 +1859,7 @@ half_closed_remote_reject_headers(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Send a HEADERS frame on that now half-closed (remote) stream.
@@ -1876,7 +1876,7 @@ half_closed_remote_accept_priority(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Send a PRIORITY frame on that now half-closed (remote) stream.
@@ -1916,7 +1916,7 @@ half_closed_remote_accept_window_update(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Send a WINDOW_UPDATE frame on that now half-closed (remote) stream.
@@ -1938,7 +1938,7 @@ rst_stream_closed_reject_data(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
 	%% Send an RST_STREAM frame to close the stream.
@@ -1960,7 +1960,7 @@ rst_stream_closed_reject_headers(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
 	%% Send an RST_STREAM frame to close the stream.
@@ -1980,7 +1980,7 @@ rst_stream_closed_accept_priority(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
 	%% Send an RST_STREAM frame to close the stream.
@@ -2000,7 +2000,7 @@ rst_stream_closed_ignore_rst_stream(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
 	%% Send an RST_STREAM frame to close the stream.
@@ -2026,7 +2026,7 @@ rst_stream_closed_reject_window_update(Config) ->
 		{<<":method">>, <<"GET">>},
 		{<<":scheme">>, <<"http">>},
 		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
-		{<<":path">>, <<"/">>}
+		{<<":path">>, <<"/long_polling">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, HeadersBlock)),
 	%% Send an RST_STREAM frame to close the stream.
@@ -2589,15 +2589,7 @@ settings_header_table_size_server(Config0) ->
 	{_, <<"200">>} = lists:keyfind(<<":status">>, 1, RespHeaders),
 	%% The decoding succeeded on the server, confirming that
 	%% the table size was updated to HeaderTableSize.
-	ok.
-
-%   SETTINGS_ENABLE_PUSH (0x2):  This setting can be used to disable
-%      server push (Section 8.2).  An endpoint MUST NOT send a
-%      PUSH_PROMISE frame if it receives this parameter set to a value of
-%      0.  An endpoint that has both set this parameter to 0 and had it
-%      acknowledged MUST treat the receipt of a PUSH_PROMISE frame as a
-%      connection error (Section 5.4.1) of type PROTOCOL_ERROR.
-%% @todo settings_disable_push
+	cowboy:stop_listener(name()).
 
 settings_max_concurrent_streams(Config0) ->
 	doc("The SETTINGS_MAX_CONCURRENT_STREAMS setting can be used to "
@@ -2623,7 +2615,7 @@ settings_max_concurrent_streams(Config0) ->
 	]),
 	%% Receive a REFUSED_STREAM stream error.
 	{ok, << _:24, 3:8, _:8, 3:32, 7:32 >>} = gen_tcp:recv(Socket, 13, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 settings_max_concurrent_streams_0(Config0) ->
 	doc("The SETTINGS_MAX_CONCURRENT_STREAMS setting can be set to "
@@ -2644,7 +2636,7 @@ settings_max_concurrent_streams_0(Config0) ->
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
 	%% Receive a REFUSED_STREAM stream error.
 	{ok, << _:24, 3:8, _:8, 1:32, 7:32 >>} = gen_tcp:recv(Socket, 13, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 %% @todo The client can limit the number of concurrent streams too. (RFC7540 5.1.2)
 %
@@ -2709,7 +2701,7 @@ settings_initial_window_size(Config0) ->
 	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
 	%% No errors follow due to our sending of more than 65535 bytes of data.
 	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
-	ok.
+	cowboy:stop_listener(name()).
 
 settings_initial_window_size_after_ack(Config0) ->
 	doc("The SETTINGS_INITIAL_WINDOW_SIZE setting can be used to "
@@ -2749,7 +2741,7 @@ settings_initial_window_size_after_ack(Config0) ->
 	]),
 	%% Receive a FLOW_CONTROL_ERROR stream error.
 	{ok, << _:24, 3:8, _:8, 1:32, 3:32 >>} = gen_tcp:recv(Socket, 13, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 settings_initial_window_size_before_ack(Config0) ->
 	doc("The SETTINGS_INITIAL_WINDOW_SIZE setting can be used to "
@@ -2794,7 +2786,7 @@ settings_initial_window_size_before_ack(Config0) ->
 	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
 	%% No errors follow due to our sending of more than 0 bytes of data.
 	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
-	ok.
+	cowboy:stop_listener(name()).
 
 settings_max_frame_size(Config0) ->
 	doc("The SETTINGS_MAX_FRAME_SIZE setting can be used to "
@@ -2824,7 +2816,7 @@ settings_max_frame_size(Config0) ->
 	{ok, _} = gen_tcp:recv(Socket, Len2, 6000),
 	%% No errors follow due to our sending of a 25000 bytes frame.
 	{error, timeout} = gen_tcp:recv(Socket, 0, 1000),
-	ok.
+	cowboy:stop_listener(name()).
 
 settings_max_frame_size_reject_too_small(Config) ->
 	doc("A SETTINGS_MAX_FRAME_SIZE smaller than 16384 must be rejected "
@@ -2882,13 +2874,35 @@ settings_max_frame_size_reject_too_large(Config) ->
 %   associated with.  If the stream identifier field specifies the value
 %   0x0, a recipient MUST respond with a connection error (Section 5.4.1)
 %   of type PROTOCOL_ERROR.
-%
-%   PUSH_PROMISE MUST NOT be sent if the SETTINGS_ENABLE_PUSH setting of
-%   the peer endpoint is set to 0.  An endpoint that has set this setting
-%   and has received acknowledgement MUST treat the receipt of a
-%   PUSH_PROMISE frame as a connection error (Section 5.4.1) of type
-%   PROTOCOL_ERROR.
-%
+
+client_settings_disable_push(Config) ->
+	doc("PUSH_PROMISE frames must not be sent when the setting "
+		"SETTINGS_ENABLE_PUSH is disabled. (RFC7540 6.5.2, RFC7540 6.6, RFC7540 8.2)"),
+	%% Do a prior knowledge handshake.
+	{ok, Socket} = gen_tcp:connect("localhost", config(port, Config), [binary, {active, false}]),
+	%% Send a valid preface.
+	ok = gen_tcp:send(Socket, ["PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", cow_http2:settings(#{
+		enable_push => false
+	})]),
+	%% Receive the server preface.
+	{ok, << Len:24 >>} = gen_tcp:recv(Socket, 3, 1000),
+	{ok, << 4:8, 0:40, _:Len/binary >>} = gen_tcp:recv(Socket, 6 + Len, 1000),
+	%% Send the SETTINGS ack.
+	ok = gen_tcp:send(Socket, cow_http2:settings_ack()),
+	%% Receive the SETTINGS ack.
+	{ok, << 0:24, 4:8, 1:8, 0:32 >>} = gen_tcp:recv(Socket, 9, 1000),
+	%% Send a HEADERS frame on a resource that sends PUSH_PROMISE frames.
+	{HeadersBlock, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/resp/push">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, fin, HeadersBlock)),
+	%% Receive a HEADERS frame as a response, no PUSH_PROMISE frames.
+	{ok, << _:24, 1:8, _:40 >>} = gen_tcp:recv(Socket, 9, 6000),
+	ok.
+
 %   Since PUSH_PROMISE reserves a stream, ignoring a PUSH_PROMISE frame
 %   causes the stream state to become indeterminate.  A receiver MUST
 %   treat the receipt of a PUSH_PROMISE on a stream that is neither
@@ -3023,7 +3037,7 @@ data_reject_overflow(Config0) ->
 	]),
 	%% Receive a FLOW_CONTROL_ERROR connection error.
 	{ok, << _:24, 7:8, _:72, 3:32 >>} = gen_tcp:recv(Socket, 17, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 data_reject_overflow_stream(Config0) ->
 	doc("DATA frames that cause the stream flow control window "
@@ -3068,7 +3082,7 @@ data_reject_overflow_stream(Config0) ->
 	]),
 	%% Receive a FLOW_CONTROL_ERROR stream error.
 	{ok, << _:24, 3:8, _:8, 1:32, 3:32 >>} = gen_tcp:recv(Socket, 13, 6000),
-	ok.
+	cowboy:stop_listener(name()).
 
 %% (RFC7540 6.9.1)
 %   Frames with zero length with the END_STREAM flag set (that

@@ -169,17 +169,24 @@ do(<<"reply4">>, Req0, Opts) ->
 	end,
 	{ok, Req, Opts};
 do(<<"stream_reply2">>, Req0, Opts) ->
-	Req = case cowboy_req:binding(arg, Req0) of
+	case cowboy_req:binding(arg, Req0) of
 		<<"binary">> ->
-			cowboy_req:stream_reply(<<"200 GOOD">>, Req0);
+			Req = cowboy_req:stream_reply(<<"200 GOOD">>, Req0),
+			stream_body(Req),
+			{ok, Req, Opts};
 		<<"error">> ->
 			ct_helper:ignore(cowboy_req, stream_reply, 3),
-			cowboy_req:stream_reply(ok, Req0);
+			Req = cowboy_req:stream_reply(ok, Req0),
+			stream_body(Req),
+			{ok, Req, Opts};
+		<<"204">> ->
+			Req = cowboy_req:stream_reply(204, Req0),
+			{ok, Req, Opts};
 		Status ->
-			cowboy_req:stream_reply(binary_to_integer(Status), Req0)
-	end,
-	stream_body(Req),
-	{ok, Req, Opts};
+			Req = cowboy_req:stream_reply(binary_to_integer(Status), Req0),
+			stream_body(Req),
+			{ok, Req, Opts}
+	end;
 do(<<"stream_reply3">>, Req0, Opts) ->
 	Req = case cowboy_req:binding(arg, Req0) of
 		<<"error">> ->
@@ -212,6 +219,84 @@ do(<<"stream_body">>, Req0, Opts) ->
 			%% Call stream_body without initiating streaming.
 			cowboy_req:stream_body(<<0:800000>>, fin, Req0),
 			{ok, Req0, Opts}
+	end;
+do(<<"stream_body_content_length">>, Req0, Opts) ->
+	case cowboy_req:binding(arg, Req0) of
+		<<"fin0">> ->
+			Req1 = cowboy_req:set_resp_header(<<"content-length">>, <<"12">>, Req0),
+			Req = cowboy_req:stream_reply(200, Req1),
+			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			cowboy_req:stream_body(<<>>, fin, Req),
+			{ok, Req, Opts};
+		<<"multiple">> ->
+			Req1 = cowboy_req:set_resp_header(<<"content-length">>, <<"12">>, Req0),
+			Req = cowboy_req:stream_reply(200, Req1),
+			cowboy_req:stream_body(<<"Hello ">>, nofin, Req),
+			cowboy_req:stream_body(<<"world">>, nofin, Req),
+			cowboy_req:stream_body(<<"!">>, fin, Req),
+			{ok, Req, Opts};
+		<<"nofin">> ->
+			Req1 = cowboy_req:set_resp_header(<<"content-length">>, <<"12">>, Req0),
+			Req = cowboy_req:stream_reply(200, Req1),
+			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			{ok, Req, Opts};
+		<<"nofin-error">> ->
+			Req1 = cowboy_req:set_resp_header(<<"content-length">>, <<"12">>, Req0),
+			Req = cowboy_req:stream_reply(200, Req1),
+			cowboy_req:stream_body(<<"Hello">>, nofin, Req),
+			{ok, Req, Opts}
+	end;
+do(<<"stream_events">>, Req0, Opts) ->
+	case cowboy_req:binding(arg, Req0) of
+		%%<<"single">>
+		%%<<"list">>
+		<<"single">> ->
+			Req = cowboy_req:stream_reply(200,
+				#{<<"content-type">> => <<"text/event-stream">>},
+				Req0),
+			cowboy_req:stream_events(#{
+				event => <<"add_comment">>,
+				data => <<"Comment text.\nWith many lines.">>
+			}, fin, Req),
+			{ok, Req, Opts};
+		<<"list">> ->
+			Req = cowboy_req:stream_reply(200,
+				#{<<"content-type">> => <<"text/event-stream">>},
+				Req0),
+			cowboy_req:stream_events([
+				#{
+					event => <<"add_comment">>,
+					data => <<"Comment text.\nWith many lines.">>
+				},
+				#{
+					comment => <<"Set retry higher\nwith many lines also.">>,
+					retry => 10000
+				},
+				#{
+					id => <<"123">>,
+					event => <<"add_comment">>,
+					data => <<"Closing!">>
+				}
+			], fin, Req),
+			{ok, Req, Opts};
+		<<"multiple">> ->
+			Req = cowboy_req:stream_reply(200,
+				#{<<"content-type">> => <<"text/event-stream">>},
+				Req0),
+			cowboy_req:stream_events(#{
+				event => <<"add_comment">>,
+				data => <<"Comment text.\nWith many lines.">>
+			}, nofin, Req),
+			cowboy_req:stream_events(#{
+				comment => <<"Set retry higher\nwith many lines also.">>,
+				retry => 10000
+			}, nofin, Req),
+			cowboy_req:stream_events(#{
+				id => <<"123">>,
+				event => <<"add_comment">>,
+				data => <<"Closing!">>
+			}, fin, Req),
+			{ok, Req, Opts}
 	end;
 do(<<"stream_trailers">>, Req0, Opts) ->
 	case cowboy_req:binding(arg, Req0) of
