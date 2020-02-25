@@ -11,29 +11,33 @@ as a Ranch protocol.
 
 == Options
 
-// @todo Might be worth moving cowboy_clear/tls/stream_h options
+// @todo Might be worth moving cowboy_clear/tls options
 // to their respective manual, when they are added.
 
 [source,erlang]
 ----
 opts() :: #{
-    connection_type         => worker | supervisor,
-    env                     => cowboy_middleware:env(),
-    idle_timeout            => timeout(),
-    inactivity_timeout      => timeout(),
-    linger_timeout          => timeout(),
-    max_empty_lines         => non_neg_integer(),
-    max_header_name_length  => non_neg_integer(),
-    max_header_value_length => non_neg_integer(),
-    max_headers             => non_neg_integer(),
-    max_keepalive           => non_neg_integer(),
-    max_method_length       => non_neg_integer(),
-    max_request_line_length => non_neg_integer(),
-    max_skip_body_length    => non_neg_integer(),
-    middlewares             => [module()],
-    request_timeout         => timeout(),
-    shutdown_timeout        => timeout(),
-    stream_handlers         => [module()]
+    active_n                 => pos_integer(),
+    chunked                  => boolean(),
+    connection_type          => worker | supervisor,
+    http10_keepalive         => boolean(),
+    idle_timeout             => timeout(),
+    inactivity_timeout       => timeout(),
+    initial_stream_flow_size => non_neg_integer(),
+    linger_timeout           => timeout(),
+    logger                   => module(),
+    max_empty_lines          => non_neg_integer(),
+    max_header_name_length   => non_neg_integer(),
+    max_header_value_length  => non_neg_integer(),
+    max_headers              => non_neg_integer(),
+    max_keepalive            => non_neg_integer(),
+    max_method_length        => non_neg_integer(),
+    max_request_line_length  => non_neg_integer(),
+    max_skip_body_length     => non_neg_integer(),
+    proxy_header             => boolean(),
+    request_timeout          => timeout(),
+    sendfile                 => boolean(),
+    stream_handlers          => [module()]
 }
 ----
 
@@ -48,62 +52,117 @@ Ranch functions `ranch:get_protocol_options/1` and
 
 The default value is given next to the option name:
 
-connection_type (supervisor)::
-    Whether the connection process also acts as a supervisor.
+active_n (100)::
 
-env (#{})::
-    Middleware environment.
+The number of packets Cowboy will request from the socket at once.
+This can be used to tweak the performance of the server. Higher
+values reduce the number of times Cowboy need to request more
+packets from the port driver at the expense of potentially
+higher memory being used.
+
+chunked (true)::
+
+Whether chunked transfer-encoding is enabled for HTTP/1.1 connections.
+Note that a response streamed to the client without the chunked
+transfer-encoding and without a content-length header will result
+in the connection being closed at the end of the response body.
++
+This option can be updated at any time using the
+`set_options` stream handler command.
+
+connection_type (supervisor)::
+
+Whether the connection process also acts as a supervisor.
+
+http10_keepalive (true)::
+
+Whether keep-alive is enabled for HTTP/1.0 connections.
 
 idle_timeout (60000)::
-    Time in ms with no data received before Cowboy closes the connection.
+
+Time in ms with no data received before Cowboy closes the connection.
++
+This option can be updated at any time using the
+`set_options` stream handler command.
 
 inactivity_timeout (300000)::
-    Time in ms with nothing received at all before Cowboy closes the connection.
+
+Time in ms with nothing received at all before Cowboy closes the connection.
+
+initial_stream_flow_size (65535)::
+
+Amount of data in bytes Cowboy will read from the socket
+right after a request was fully received. This is a soft
+limit.
 
 linger_timeout (1000)::
-    Time in ms that Cowboy will wait when closing the connection. This is
-    necessary to avoid the TCP reset problem as described in the
-    https://tools.ietf.org/html/rfc7230#section-6.6[section 6.6 of RFC7230].
+
+Time in ms that Cowboy will wait when closing the connection. This is
+necessary to avoid the TCP reset problem as described in the
+https://tools.ietf.org/html/rfc7230#section-6.6[section 6.6 of RFC7230].
+
+logger (error_logger)::
+
+The module that will be used to write log messages.
 
 max_empty_lines (5)::
-    Maximum number of empty lines before a request.
+
+Maximum number of empty lines before a request.
 
 max_header_name_length (64)::
-    Maximum length of header names.
+
+Maximum length of header names.
 
 max_header_value_length (4096)::
-    Maximum length of header values.
+
+Maximum length of header values.
 
 max_headers (100)::
-    Maximum number of headers allowed per request.
+
+Maximum number of headers allowed per request.
 
 max_keepalive (100)::
-    Maximum number of requests allowed per connection.
+
+Maximum number of requests allowed per connection.
 
 max_method_length (32)::
-    Maximum length of the method.
+
+Maximum length of the method.
 
 max_request_line_length (8000)::
-    Maximum length of the request line.
+
+Maximum length of the request line.
 
 max_skip_body_length (1000000)::
-    Maximum length Cowboy is willing to skip when the user code did not read the body fully.
-    When the remaining length is too large or unknown Cowboy will close the connection.
 
-middlewares ([cowboy_router, cowboy_handler])::
-    Middlewares to run for every request.
+Maximum length Cowboy is willing to skip when the user code did not read the body fully.
+When the remaining length is too large or unknown Cowboy will close the connection.
+
+proxy_header (false)::
+
+Whether incoming connections have a PROXY protocol header. The
+proxy information will be passed forward via the `proxy_header`
+key of the Req object.
 
 request_timeout (5000)::
-    Time in ms with no requests before Cowboy closes the connection.
 
-shutdown_timeout (5000)::
-    Time in ms Cowboy will wait for child processes to shut down before killing them.
+Time in ms with no requests before Cowboy closes the connection.
+
+sendfile (true)::
+
+Whether the sendfile syscall may be used. It can be useful to disable
+it on systems where the syscall has a buggy implementation, for example
+under VirtualBox when using shared folders.
 
 stream_handlers ([cowboy_stream_h])::
-    Ordered list of stream handlers that will handle all stream events.
+
+Ordered list of stream handlers that will handle all stream events.
 
 == Changelog
 
+* *2.8*: The `active_n` option was added.
+* *2.7*: The `initial_stream_flow_size` and `logger` options were added.
+* *2.6*: The `chunked`, `http10_keepalive`, `proxy_header` and `sendfile` options were added.
 * *2.5*: The `linger_timeout` option was added.
 * *2.2*: The `max_skip_body_length` option was added.
 * *2.0*: The `timeout` option was renamed `request_timeout`.

@@ -53,10 +53,11 @@ init_dispatch(Config) ->
 		{"/crash/:key/period", echo_h, #{length => 999999999, period => 1000, crash => true}},
 		{"/no-opts/:key", echo_h, #{crash => true}},
 		{"/opts/:key/length", echo_h, #{length => 1000}},
-		{"/opts/:key/period", echo_h, #{length => 999999999, period => 1000}},
+		{"/opts/:key/period", echo_h, #{length => 999999999, period => 2000}},
 		{"/opts/:key/timeout", echo_h, #{timeout => 1000, crash => true}},
 		{"/100-continue/:key", echo_h, []},
 		{"/full/:key", echo_h, []},
+		{"/spawn/:key", echo_h, []},
 		{"/no/:key", echo_h, []},
 		{"/direct/:key/[...]", echo_h, []},
 		{"/:key/[...]", echo_h, []}
@@ -73,10 +74,7 @@ do_body(Method, Path, Headers, Config) ->
 do_body(Method, Path, Headers0, Body, Config) ->
 	ConnPid = gun_open(Config),
 	Headers = [{<<"accept-encoding">>, <<"gzip">>}|Headers0],
-	Ref = case Body of
-		<<>> -> gun:request(ConnPid, Method, Path, Headers);
-		_ -> gun:request(ConnPid, Method, Path, Headers, Body)
-	end,
+	Ref = gun:request(ConnPid, Method, Path, Headers, Body),
 	{response, IsFin, 200, RespHeaders} = gun:await(ConnPid, Ref, 10000),
 	{ok, RespBody} = case IsFin of
 		nofin -> gun:await_body(ConnPid, Ref);
@@ -88,10 +86,7 @@ do_body(Method, Path, Headers0, Body, Config) ->
 do_body_error(Method, Path, Headers0, Body, Config) ->
 	ConnPid = gun_open(Config),
 	Headers = [{<<"accept-encoding">>, <<"gzip">>}|Headers0],
-	Ref = case Body of
-		<<>> -> gun:request(ConnPid, Method, Path, Headers);
-		_ -> gun:request(ConnPid, Method, Path, Headers, Body)
-	end,
+	Ref = gun:request(ConnPid, Method, Path, Headers, Body),
 	{response, _, Status, RespHeaders} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid),
 	{Status, RespHeaders}.
@@ -104,7 +99,7 @@ do_get(Path, Headers, Config) ->
 	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}|Headers]),
 	{response, IsFin, Status, RespHeaders} = gun:await(ConnPid, Ref),
 	{ok, RespBody} = case IsFin of
-		nofin -> gun:await_body(ConnPid, Ref);
+		nofin -> gun:await_body(ConnPid, Ref, 30000);
 		fin -> {ok, <<>>}
 	end,
 	gun:close(ConnPid),
@@ -157,7 +152,6 @@ do_get_error(Path, Headers, Config) ->
 		nofin -> gun:await_body(ConnPid, Ref);
 		fin -> {ok, <<>>}
 	end,
-	gun:close(ConnPid),
 	case Result of
 		{ok, RespBody} -> {Status, RespHeaders, do_decode(RespHeaders, RespBody)};
 		_ -> Result
@@ -186,7 +180,7 @@ cert(Config) ->
 do_cert(Config0) ->
 	doc("A client TLS certificate was provided."),
 	{CaCert, Cert, Key} = ct_helper:make_certs(),
-	Config = [{transport_opts, [
+	Config = [{tls_opts, [
 		{cert, Cert},
 		{key, Key},
 		{cacerts, [CaCert]}
@@ -215,7 +209,9 @@ headers(Config) ->
 
 do_headers(Path, Config) ->
 	%% We always send accept-encoding with this test suite's requests.
-	<<"#{<<\"accept-encoding\">> => <<\"gzip\">>,<<\"header\">> => <<\"value\">>", _/bits>>
+	<<"#{<<\"accept-encoding\">> => <<\"gzip\">>,"
+		"<<\"content-length\">> => <<\"0\">>,"
+		"<<\"header\">> => <<\"value\">>", _/bits>>
 		= do_get_body(Path, [{<<"header">>, "value"}], Config),
 	ok.
 
@@ -288,6 +284,27 @@ parse_cookies(Config) ->
 		[{<<"cookie">>, "bad name=strawberry"}], Config),
 	{400, _, _} = do_get("/parse_cookies",
 		[{<<"cookie">>, "goodname=strawberry\tmilkshake"}], Config),
+	ok.
+
+filter_then_parse_cookies(Config) ->
+	doc("Filter cookies then parse them."),
+	<<"[]">> = do_get_body("/filter_then_parse_cookies", Config),
+	<<"[{<<\"cake\">>,<<\"strawberry\">>}]">>
+		= do_get_body("/filter_then_parse_cookies", [{<<"cookie">>, "cake=strawberry"}], Config),
+	<<"[{<<\"cake\">>,<<\"strawberry\">>},{<<\"color\">>,<<\"blue\">>}]">>
+		= do_get_body("/filter_then_parse_cookies", [{<<"cookie">>, "cake=strawberry; color=blue"}], Config),
+	<<"[{<<\"cake\">>,<<\"strawberry\">>},{<<\"color\">>,<<\"blue\">>}]">>
+		= do_get_body("/filter_then_parse_cookies",
+			[{<<"cookie">>, "cake=strawberry"}, {<<"cookie">>, "color=blue"}], Config),
+	<<"[]">>
+		= do_get_body("/filter_then_parse_cookies",
+			[{<<"cookie">>, "bad name=strawberry"}], Config),
+	<<"[{<<\"cake\">>,<<\"strawberry\">>}]">>
+		= do_get_body("/filter_then_parse_cookies",
+			[{<<"cookie">>, "bad name=strawberry; cake=strawberry"}], Config),
+	<<"[]">>
+		= do_get_body("/filter_then_parse_cookies",
+			[{<<"cookie">>, "Blocked by http://www.example.com/upgrade-to-remove"}], Config),
 	ok.
 
 parse_header(Config) ->
@@ -456,24 +473,29 @@ read_body(Config) ->
 	ok.
 
 read_body_mtu(Config) ->
-	doc("Request body whose sizes are around the MTU."),
-	MTU = ct_helper:get_loopback_mtu(),
-	_ = [begin
-		Body = <<0:Size/unit:8>>,
-		Body = do_body("POST", "/full/read_body", [], Body, Config)
-	end || Size <- lists:seq(MTU - 10, MTU + 10)],
-	ok.
+	case os:type() of
+		{win32, _} ->
+			{skip, "Loopback MTU size is 0xFFFFFFFF on Windows."};
+		{unix, _} ->
+			doc("Request body whose sizes are around the MTU."),
+			MTU = ct_helper:get_loopback_mtu(),
+			_ = [begin
+				Body = <<0:Size/unit:8>>,
+				Body = do_body("POST", "/full/read_body", [], Body, Config)
+			end || Size <- lists:seq(MTU - 10, MTU + 10)],
+			ok
+	end.
 
 read_body_period(Config) ->
-	doc("Read the request body for at most 1 second."),
+	doc("Read the request body for at most 2 seconds."),
 	ConnPid = gun_open(Config),
 	Body = <<0:8000000>>,
-	Ref = gun:request(ConnPid, "POST", "/opts/read_body/period", [
+	Ref = gun:headers(ConnPid, "POST", "/opts/read_body/period", [
 		{<<"content-length">>, integer_to_binary(byte_size(Body) * 2)}
 	]),
-	%% The body is sent twice, first with nofin, then wait 2 seconds, then again with fin.
+	%% The body is sent twice, first with nofin, then wait 3 seconds, then again with fin.
 	gun:data(ConnPid, Ref, nofin, Body),
-	timer:sleep(2000),
+	timer:sleep(3000),
 	gun:data(ConnPid, Ref, fin, Body),
 	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
 	{ok, Body} = gun:await_body(ConnPid, Ref),
@@ -482,11 +504,16 @@ read_body_period(Config) ->
 %% We expect a crash.
 do_read_body_timeout(Path, Body, Config) ->
 	ConnPid = gun_open(Config),
-	Ref = gun:request(ConnPid, "POST", Path, [
+	Ref = gun:headers(ConnPid, "POST", Path, [
 		{<<"content-length">>, integer_to_binary(byte_size(Body))}
 	]),
 	{response, _, 500, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
+
+read_body_spawn(Config) ->
+	doc("Confirm we can use cowboy_req:read_body/1,2 from another process."),
+	<<"hello world!">> = do_body("POST", "/spawn/read_body", [], "hello world!", Config),
+	ok.
 
 read_body_expect_100_continue(Config) ->
 	doc("Request body with a 100-continue expect header."),
@@ -521,38 +548,42 @@ read_urlencoded_body(Config) ->
 	<<"[{<<\"abc\">>,true}]">> = do_body("POST", "/read_urlencoded_body", [], "abc", Config),
 	<<"[{<<\"a\">>,<<\"b\">>},{<<\"c\">>,<<\"d e\">>}]">>
 		= do_body("POST", "/read_urlencoded_body", [], "a=b&c=d+e", Config),
-	%% Send a 10MB body, larger than the default length, to ensure a crash occurs.
-	ok = do_read_urlencoded_body_too_large("/no-opts/read_urlencoded_body",
-		string:chars($a, 10000000), Config),
-	%% We read any length for at most 1 second.
-	%%
-	%% The body is sent twice, first with nofin, then wait 1.1 second, then again with fin.
-	%% We expect the handler to crash because read_urlencoded_body expects the full body.
-	ok = do_read_urlencoded_body_too_long("/crash/read_urlencoded_body/period", <<"abc">>, Config),
 	%% The timeout value is set too low on purpose to ensure a crash occurs.
 	ok = do_read_body_timeout("/opts/read_urlencoded_body/timeout", <<"abc">>, Config),
 	%% Ensure parse errors result in a 400 response.
 	{400, _} = do_body_error("POST", "/read_urlencoded_body", [], "%%%%%", Config),
 	ok.
 
+read_urlencoded_body_too_large(Config) ->
+	doc("application/x-www-form-urlencoded request body too large. "
+		"Send a 10MB body, larger than the default length, to ensure a crash occurs."),
+	do_read_urlencoded_body_too_large("/no-opts/read_urlencoded_body",
+		string:chars($a, 10000000), Config).
+
 %% We expect a crash.
 do_read_urlencoded_body_too_large(Path, Body, Config) ->
 	ConnPid = gun_open(Config),
-	Ref = gun:request(ConnPid, "POST", Path, [
+	Ref = gun:headers(ConnPid, "POST", Path, [
 		{<<"content-length">>, integer_to_binary(iolist_size(Body))}
 	]),
 	gun:data(ConnPid, Ref, fin, Body),
 	{response, _, 413, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
 
+read_urlencoded_body_too_long(Config) ->
+	doc("application/x-www-form-urlencoded request body sent too slow. "
+		"The body is sent twice with 2s wait in-between. It is read by the handler "
+		"for at most 1 second. A crash occurs because we don't have the full body."),
+	do_read_urlencoded_body_too_long("/crash/read_urlencoded_body/period", <<"abc">>, Config).
+
 %% We expect a crash.
 do_read_urlencoded_body_too_long(Path, Body, Config) ->
 	ConnPid = gun_open(Config),
-	Ref = gun:request(ConnPid, "POST", Path, [
+	Ref = gun:headers(ConnPid, "POST", Path, [
 		{<<"content-length">>, integer_to_binary(byte_size(Body) * 2)}
 	]),
 	gun:data(ConnPid, Ref, nofin, Body),
-	timer:sleep(1100),
+	timer:sleep(2000),
 	gun:data(ConnPid, Ref, fin, Body),
 	{response, _, 408, RespHeaders} = gun:await(ConnPid, Ref),
 	_ = case config(protocol, Config) of
@@ -577,19 +608,23 @@ read_and_match_urlencoded_body(Config) ->
 	{400, _} = do_body_error("POST", "/match/body_qs/a/c", [], "a=b", Config),
 	%% Ensure parse errors result in a 400 response.
 	{400, _} = do_body_error("POST", "/match/body_qs", [], "%%%%%", Config),
-	%% Send a 10MB body, larger than the default length, to ensure a crash occurs.
-	ok = do_read_urlencoded_body_too_large(
-		"/no-opts/read_and_match_urlencoded_body",
-		string:chars($a, 10000000), Config),
-	%% We read any length for at most 1 second.
-	%%
-	%% The body is sent twice, first with nofin, then wait 1.1 second, then again with fin.
-	%% We expect the handler to crash because read_and_match_urlencoded_body expects the full body.
-	ok = do_read_urlencoded_body_too_long(
-		"/crash/read_and_match_urlencoded_body/period", <<"abc">>, Config),
 	%% The timeout value is set too low on purpose to ensure a crash occurs.
 	ok = do_read_body_timeout("/opts/read_and_match_urlencoded_body/timeout", <<"abc">>, Config),
 	ok.
+
+read_and_match_urlencoded_body_too_large(Config) ->
+	doc("Read and match an application/x-www-form-urlencoded request body too large. "
+		"Send a 10MB body, larger than the default length, to ensure a crash occurs."),
+	do_read_urlencoded_body_too_large(
+		"/no-opts/read_and_match_urlencoded_body",
+		string:chars($a, 10000000), Config).
+
+read_and_match_urlencoded_body_too_long(Config) ->
+	doc("Read and match an application/x-www-form-urlencoded request body sent too slow. "
+		"The body is sent twice with 2s wait in-between. It is read by the handler "
+		"for at most 1 second. A crash occurs because we don't have the full body."),
+	do_read_urlencoded_body_too_long(
+		"/crash/read_and_match_urlencoded_body/period", <<"abc">>, Config).
 
 multipart(Config) ->
 	doc("Multipart request body."),
@@ -885,19 +920,52 @@ stream_reply3(Config) ->
 	{500, _, _} = do_get("/resp/stream_reply3/error", Config),
 	ok.
 
-stream_body_multiple(Config) ->
-	doc("Streamed body via multiple calls."),
-	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/multiple", Config),
-	ok.
-
 stream_body_fin0(Config) ->
 	doc("Streamed body with last chunk of size 0."),
 	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/fin0", Config),
 	ok.
 
+stream_body_multiple(Config) ->
+	doc("Streamed body via multiple calls."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/multiple", Config),
+	ok.
+
+stream_body_loop(Config) ->
+	doc("Streamed body via a fast loop."),
+	{200, _, <<0:32000000/unit:8>>} = do_get("/resp/stream_body/loop", Config),
+	ok.
+
 stream_body_nofin(Config) ->
 	doc("Unfinished streamed body."),
 	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/nofin", Config),
+	ok.
+
+stream_body_sendfile(Config) ->
+	doc("Streamed body via multiple calls, including sendfile calls."),
+	{ok, AppFile} = file:read_file(code:where_is_file("cowboy.app")),
+	ExpectedBody = iolist_to_binary([
+		<<"Hello ">>,
+		AppFile,
+		<<" interspersed ">>,
+		AppFile,
+		<<" world!">>
+	]),
+	{200, _, ExpectedBody} = do_get("/resp/stream_body/sendfile", Config),
+	ok.
+
+stream_body_sendfile_fin(Config) ->
+	doc("Streamed body via multiple calls, including a sendfile final call."),
+	{ok, AppFile} = file:read_file(code:where_is_file("cowboy.app")),
+	ExpectedBody = iolist_to_binary([
+		<<"Hello! ">>,
+		AppFile
+	]),
+	{200, _, ExpectedBody} = do_get("/resp/stream_body/sendfile_fin", Config),
+	ok.
+
+stream_body_spawn(Config) ->
+	doc("Confirm we can use cowboy_req:stream_body/3 from another process."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/spawn", Config),
 	ok.
 
 stream_body_content_length_multiple(Config) ->
@@ -916,16 +984,21 @@ stream_body_content_length_nofin(Config) ->
 	ok.
 
 stream_body_content_length_nofin_error(Config) ->
-	doc("Not all of body sent."),
+	doc("Not all of the response body sent."),
 	case config(protocol, Config) of
 		http ->
 			case do_get_error("/resp/stream_body_content_length/nofin-error", Config) of
+				%% When compression is used content-length is not sent.
 				{200, Headers, <<"Hello">>} ->
 					{_, <<"gzip">>} = lists:keyfind(<<"content-encoding">>, 1, Headers);
-				{error, {closed, "The connection was lost."}} ->
-					ok;
-				{error, timeout} ->
-					ok
+				%% The server closes the connection when the body couldn't be sent fully.
+				{error, {stream_error, closed}} ->
+					receive
+						{gun_down, ConnPid, _, _, _} ->
+							gun:close(ConnPid)
+					after 1000 ->
+						error(timeout)
+					end
 			end;
 		http2 ->
 			%% @todo HTTP2 should have the same content-length checks
@@ -995,7 +1068,7 @@ stream_trailers(Config) ->
 
 stream_trailers_large(Config) ->
 	doc("Stream large body followed by trailer headers."),
-	{200, RespHeaders, <<0:800000>>, [
+	{200, RespHeaders, <<0:80000000>>, [
 		{<<"grpc-status">>, <<"0">>}
 	]} = do_trailers("/resp/stream_trailers/large", Config),
 	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),

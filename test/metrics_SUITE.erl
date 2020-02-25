@@ -71,9 +71,12 @@ init_compress_opts(Config) ->
 init_routes(_) -> [
 	{"localhost", [
 		{"/", hello_h, []},
+		{"/crash/no_reply", crash_h, no_reply},
+		{"/crash/reply", crash_h, reply},
 		{"/default", default_h, []},
 		{"/full/:key", echo_h, []},
 		{"/resp/:key[/:arg]", resp_h, []},
+		{"/set_options/:key", set_options_h, []},
 		{"/ws_echo", ws_echo, []}
 	]}
 ].
@@ -96,9 +99,13 @@ do_metrics_callback() ->
 
 hello_world(Config) ->
 	doc("Confirm metrics are correct for a normal GET request."),
-	do_get("/", Config).
+	do_get("/", #{}, Config).
 
-do_get(Path, Config) ->
+user_data(Config) ->
+	doc("Confirm user data can be attached to metrics."),
+	do_get("/set_options/metrics_user_data", #{handler => set_options_h}, Config).
+
+do_get(Path, UserData, Config) ->
 	%% Perform a GET request.
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, Path, [
@@ -151,7 +158,8 @@ do_get(Path, Config) ->
 				streamid := 1,
 				reason := normal,
 				req := #{},
-				informational := []
+				informational := [],
+				user_data := UserData
 			} = Metrics,
 			%% All good!
 			ok
@@ -214,7 +222,8 @@ post_body(Config) ->
 				streamid := 1,
 				reason := normal,
 				req := #{},
-				informational := []
+				informational := [],
+				user_data := #{}
 			} = Metrics,
 			%% All good!
 			ok
@@ -271,7 +280,8 @@ no_resp_body(Config) ->
 				streamid := 1,
 				reason := normal,
 				req := #{},
-				informational := []
+				informational := [],
+				user_data := #{}
 			} = Metrics,
 			%% All good!
 			ok
@@ -280,21 +290,20 @@ no_resp_body(Config) ->
 	end.
 
 early_error(Config) ->
-	case config(protocol, Config) of
-		http -> do_early_error(Config);
-		http2 -> doc("The callback early_error/5 is not currently used for HTTP/2.")
-	end.
-
-do_early_error(Config) ->
 	doc("Confirm metrics are correct for an early_error response."),
 	%% Perform a malformed GET request.
 	ConnPid = gun_open(Config),
-	Ref = gun:get(ConnPid, "/", [
+	%% We must use different solutions to hit early_error with a stream_error
+	%% reason in both protocols.
+	{Method, Headers, Status, Error} = case config(protocol, Config) of
+		http -> {<<"GET">>, [{<<"host">>, <<"host:port">>}], 400, protocol_error};
+		http2 -> {<<"TRACE">>, [], 501, no_error}
+	end,
+	Ref = gun:request(ConnPid, Method, "/", [
 		{<<"accept-encoding">>, <<"gzip">>},
-		{<<"host">>, <<"host:port">>},
 		{<<"x-test-pid">>, pid_to_list(self())}
-	]),
-	{response, fin, 400, RespHeaders} = gun:await(ConnPid, Ref),
+	|Headers], <<>>),
+	{response, fin, Status, RespHeaders} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid),
 	%% Receive the metrics and validate them.
 	receive
@@ -304,9 +313,9 @@ do_early_error(Config) ->
 				ref := _,
 				pid := From,
 				streamid := 1,
-				reason := {stream_error, 1, protocol_error, _},
+				reason := {stream_error, Error, _},
 				partial_req := #{},
-				resp_status := 400,
+				resp_status := Status,
 				resp_headers := ExpectedRespHeaders,
 				early_error_time := _,
 				resp_body_length := 0
@@ -321,7 +330,7 @@ do_early_error(Config) ->
 early_error_request_line(Config) ->
 	case config(protocol, Config) of
 		http -> do_early_error_request_line(Config);
-		http2 -> doc("The callback early_error/5 is not currently used for HTTP/2.")
+		http2 -> doc("There are no request lines in HTTP/2.")
 	end.
 
 do_early_error_request_line(Config) ->
@@ -359,7 +368,7 @@ do_early_error_request_line(Config) ->
 %% This test is identical to normal GET except for the handler.
 stream_reply(Config) ->
 	doc("Confirm metrics are correct for long polling."),
-	do_get("/resp/stream_reply2/200", Config).
+	do_get("/resp/stream_reply2/200", #{}, Config).
 
 ws(Config) ->
 	case config(protocol, Config) of
@@ -419,7 +428,8 @@ do_ws(Config) ->
 						<<"sec-websocket-accept">> := _
 					},
 					time := _
-				}]
+				}],
+				user_data := #{}
 			} = Metrics,
 			%% All good!
 			ok
@@ -434,3 +444,122 @@ do_ws(Config) ->
 		error(timeout)
 	end,
 	gun:close(ConnPid).
+
+error_response(Config) ->
+	doc("Confirm metrics are correct when an error_response command is returned."),
+	%% Perform a GET request.
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/crash/no_reply", [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"x-test-pid">>, pid_to_list(self())}
+	]),
+	{response, fin, 500, RespHeaders} = gun:await(ConnPid, Ref),
+	timer:sleep(100),
+	gun:close(ConnPid),
+	%% Receive the metrics and validate them.
+	receive
+		{metrics, From, Metrics} ->
+			%% Ensure the timestamps are in the expected order.
+			#{
+				req_start := ReqStart, req_end := ReqEnd,
+				resp_start := RespStart, resp_end := RespEnd
+			} = Metrics,
+			true = (ReqStart =< RespStart)
+				and (RespStart =< RespEnd)
+				and (RespEnd =< ReqEnd),
+			%% We didn't send a body.
+			#{
+				req_body_start := undefined,
+				req_body_end := undefined,
+				req_body_length := 0
+			} = Metrics,
+			%% We got a 500 response without a body.
+			#{
+				resp_status := 500,
+				resp_headers := ExpectedRespHeaders,
+				resp_body_length := 0
+			} = Metrics,
+			ExpectedRespHeaders = maps:from_list(RespHeaders),
+			%% The request process executed normally.
+			#{procs := Procs} = Metrics,
+			[{_, #{
+				spawn := ProcSpawn,
+				exit := ProcExit,
+				reason := {crash, _StackTrace}
+			}}] = maps:to_list(Procs),
+			true = ProcSpawn =< ProcExit,
+			%% Confirm other metadata are as expected.
+			#{
+				ref := _,
+				pid := From,
+				streamid := 1,
+				reason := {internal_error, {'EXIT', _Pid, {crash, _StackTrace}}, 'Stream process crashed.'},
+				req := #{},
+				informational := [],
+				user_data := #{}
+			} = Metrics,
+			%% All good!
+			ok
+	after 1000 ->
+		error(timeout)
+	end.
+
+error_response_after_reply(Config) ->
+	doc("Confirm metrics are correct when an error_response command is returned "
+		"after a response was sent."),
+	%% Perform a GET request.
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/crash/reply", [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"x-test-pid">>, pid_to_list(self())}
+	]),
+	{response, fin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	timer:sleep(100),
+	gun:close(ConnPid),
+	%% Receive the metrics and validate them.
+	receive
+		{metrics, From, Metrics} ->
+			%% Ensure the timestamps are in the expected order.
+			#{
+				req_start := ReqStart, req_end := ReqEnd,
+				resp_start := RespStart, resp_end := RespEnd
+			} = Metrics,
+			true = (ReqStart =< RespStart)
+				and (RespStart =< RespEnd)
+				and (RespEnd =< ReqEnd),
+			%% We didn't send a body.
+			#{
+				req_body_start := undefined,
+				req_body_end := undefined,
+				req_body_length := 0
+			} = Metrics,
+			%% We got a 200 response without a body.
+			#{
+				resp_status := 200,
+				resp_headers := ExpectedRespHeaders,
+				resp_body_length := 0
+			} = Metrics,
+			ExpectedRespHeaders = maps:from_list(RespHeaders),
+			%% The request process executed normally.
+			#{procs := Procs} = Metrics,
+			[{_, #{
+				spawn := ProcSpawn,
+				exit := ProcExit,
+				reason := {crash, _StackTrace}
+			}}] = maps:to_list(Procs),
+			true = ProcSpawn =< ProcExit,
+			%% Confirm other metadata are as expected.
+			#{
+				ref := _,
+				pid := From,
+				streamid := 1,
+				reason := {internal_error, {'EXIT', _Pid, {crash, _StackTrace}}, 'Stream process crashed.'},
+				req := #{},
+				informational := [],
+				user_data := #{}
+			} = Metrics,
+			%% All good!
+			ok
+	after 1000 ->
+		error(timeout)
+	end.

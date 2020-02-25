@@ -17,10 +17,6 @@
 -module(cowboy_websocket).
 -behaviour(cowboy_sub_protocol).
 
--ifdef(OTP_RELEASE).
--compile({nowarn_deprecated_function, [{erlang, get_stacktrace, 0}]}).
--endif.
-
 -export([is_upgrade_request/1]).
 -export([upgrade/4]).
 -export([upgrade/5]).
@@ -31,7 +27,12 @@
 -export([system_terminate/4]).
 -export([system_code_change/4]).
 
--type commands() :: [cow_ws:frame()].
+-type commands() :: [cow_ws:frame()
+	| {active, boolean()}
+	| {deflate, boolean()}
+	| {set_options, map()}
+	| {shutdown_reason, any()}
+].
 -export_type([commands/0]).
 
 -type call_result(State) :: {commands(), State} | {commands(), State, hibernate}.
@@ -65,10 +66,13 @@
 -optional_callbacks([terminate/3]).
 
 -type opts() :: #{
+	active_n => pos_integer(),
 	compress => boolean(),
+	deflate_opts => cow_ws:deflate_opts(),
 	idle_timeout => timeout(),
 	max_frame_size => non_neg_integer() | infinity,
-	req_filter => fun((cowboy_req:req()) -> map())
+	req_filter => fun((cowboy_req:req()) -> map()),
+	validate_utf8 => boolean()
 }.
 -export_type([opts/0]).
 
@@ -77,20 +81,21 @@
 	ref :: ranch:ref(),
 	socket = undefined :: inet:socket() | {pid(), cowboy_stream:streamid()} | undefined,
 	transport = undefined :: module() | undefined,
+	opts = #{} :: opts(),
 	active = true :: boolean(),
 	handler :: module(),
 	key = undefined :: undefined | binary(),
-	timeout = infinity :: timeout(),
 	timeout_ref = undefined :: undefined | reference(),
-	compress = false :: boolean(),
-	max_frame_size :: non_neg_integer() | infinity,
-	messages = undefined :: undefined | {atom(), atom(), atom()},
+	messages = undefined :: undefined | {atom(), atom(), atom()}
+		| {atom(), atom(), atom(), atom()},
 	hibernate = false :: boolean(),
 	frag_state = undefined :: cow_ws:frag_state(),
 	frag_buffer = <<>> :: binary(),
-	utf8_state = 0 :: cow_ws:utf8_state(),
+	utf8_state :: cow_ws:utf8_state(),
+	deflate = true :: boolean(),
 	extensions = #{} :: map(),
-	req = #{} :: map()
+	req = #{} :: map(),
+	shutdown_reason = normal :: any()
 }).
 
 %% Because the HTTP/1.1 and HTTP/2 handshakes are so different,
@@ -125,15 +130,15 @@ upgrade(Req, Env, Handler, HandlerState) ->
 	when Req::cowboy_req:req(), Env::cowboy_middleware:env().
 %% @todo Immediately crash if a response has already been sent.
 upgrade(Req0=#{version := Version}, Env, Handler, HandlerState, Opts) ->
-	Timeout = maps:get(idle_timeout, Opts, 60000),
-	MaxFrameSize = maps:get(max_frame_size, Opts, infinity),
-	Compress = maps:get(compress, Opts, false),
 	FilteredReq = case maps:get(req_filter, Opts, undefined) of
 		undefined -> maps:with([method, version, scheme, host, port, path, qs, peer], Req0);
 		FilterFun -> FilterFun(Req0)
 	end,
-	State0 = #state{handler=Handler, timeout=Timeout, compress=Compress,
-		max_frame_size=MaxFrameSize, req=FilteredReq},
+	Utf8State = case maps:get(validate_utf8, Opts, true) of
+		true -> 0;
+		false -> undefined
+	end,
+	State0 = #state{opts=Opts, handler=Handler, utf8_state=Utf8State, req=FilteredReq},
 	try websocket_upgrade(State0, Req0) of
 		{ok, State, Req} ->
 			websocket_handshake(State, Req, HandlerState, Env);
@@ -174,13 +179,14 @@ websocket_version(State, Req) ->
 	end,
 	websocket_extensions(State, Req#{websocket_version => WsVersion}).
 
-websocket_extensions(State=#state{compress=Compress}, Req) ->
+websocket_extensions(State=#state{opts=Opts}, Req) ->
 	%% @todo We want different options for this. For example
 	%% * compress everything auto
 	%% * compress only text auto
 	%% * compress only binary auto
 	%% * compress nothing auto (but still enabled it)
 	%% * disable compression
+	Compress = maps:get(compress, Opts, false),
 	case {Compress, cowboy_req:parse_header(<<"sec-websocket-extensions">>, Req)} of
 		{true, Extensions} when Extensions =/= undefined ->
 			websocket_extensions(State, Req, Extensions, []);
@@ -193,15 +199,15 @@ websocket_extensions(State, Req, [], []) ->
 websocket_extensions(State, Req, [], [<<", ">>|RespHeader]) ->
 	{ok, State, cowboy_req:set_resp_header(<<"sec-websocket-extensions">>, lists:reverse(RespHeader), Req)};
 %% For HTTP/2 we ARE on the controlling process and do NOT want to update the owner.
-websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid, version := Version},
+websocket_extensions(State=#state{opts=Opts, extensions=Extensions},
+		Req=#{pid := Pid, version := Version},
 		[{<<"permessage-deflate">>, Params}|Tail], RespHeader) ->
-	%% @todo Make deflate options configurable.
-	Opts0 = #{level => best_compression, mem_level => 8, strategy => default},
-	Opts = case Version of
-		'HTTP/1.1' -> Opts0#{owner => Pid};
-		_ -> Opts0
+	DeflateOpts0 = maps:get(deflate_opts, Opts, #{}),
+	DeflateOpts = case Version of
+		'HTTP/1.1' -> DeflateOpts0#{owner => Pid};
+		_ -> DeflateOpts0
 	end,
-	try cow_ws:negotiate_permessage_deflate(Params, Extensions, Opts) of
+	try cow_ws:negotiate_permessage_deflate(Params, Extensions, DeflateOpts) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
@@ -210,15 +216,15 @@ websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid, vers
 	catch exit:{error, incompatible_zlib_version, _} ->
 		websocket_extensions(State, Req, Tail, RespHeader)
 	end;
-websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid, version := Version},
+websocket_extensions(State=#state{opts=Opts, extensions=Extensions},
+		Req=#{pid := Pid, version := Version},
 		[{<<"x-webkit-deflate-frame">>, Params}|Tail], RespHeader) ->
-	%% @todo Make deflate options configurable.
-	Opts0 = #{level => best_compression, mem_level => 8, strategy => default},
-	Opts = case Version of
-		'HTTP/1.1' -> Opts0#{owner => Pid};
-		_ -> Opts0
+	DeflateOpts0 = maps:get(deflate_opts, Opts, #{}),
+	DeflateOpts = case Version of
+		'HTTP/1.1' -> DeflateOpts0#{owner => Pid};
+		_ -> DeflateOpts0
 	end,
-	try cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, Opts) of
+	try cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, DeflateOpts) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
@@ -290,40 +296,92 @@ takeover(Parent, Ref, Socket, Transport, _Opts, Buffer,
 	State = loop_timeout(State0#state{parent=Parent,
 		ref=Ref, socket=Socket, transport=Transport,
 		key=undefined, messages=Messages}),
+	%% We call parse_header/3 immediately because there might be
+	%% some data in the buffer that was sent along with the handshake.
+	%% While it is not allowed by the protocol to send frames immediately,
+	%% we still want to process that data if any.
 	case erlang:function_exported(Handler, websocket_init, 1) of
 		true -> handler_call(State, HandlerState, #ps_header{buffer=Buffer},
-			websocket_init, undefined, fun before_loop/3);
-		false -> before_loop(State, HandlerState, #ps_header{buffer=Buffer})
+			websocket_init, undefined, fun after_init/3);
+		false -> after_init(State, HandlerState, #ps_header{buffer=Buffer})
 	end.
 
-before_loop(State=#state{active=false}, HandlerState, ParseState) ->
-	loop(State, HandlerState, ParseState);
-%% @todo We probably shouldn't do the setopts if we have not received a socket message.
-%% @todo We need to hibernate when HTTP/2 is used too.
-before_loop(State=#state{socket=Stream={Pid, _}, transport=undefined},
-		HandlerState, ParseState) ->
+after_init(State=#state{active=true}, HandlerState, ParseState) ->
+	%% Enable active,N for HTTP/1.1, and auto read_body for HTTP/2.
+	%% We must do this only after calling websocket_init/1 (if any)
+	%% to give the handler a chance to disable active mode immediately.
+	setopts_active(State),
+	maybe_read_body(State),
+	parse_header(State, HandlerState, ParseState);
+after_init(State, HandlerState, ParseState) ->
+	parse_header(State, HandlerState, ParseState).
+
+%% We have two ways of reading the body for Websocket. For HTTP/1.1
+%% we have full control of the socket and can therefore use active,N.
+%% For HTTP/2 we are just a stream, and are instead using read_body
+%% (automatic mode). Technically HTTP/2 will only go passive after
+%% receiving the next data message, while HTTP/1.1 goes passive
+%% immediately but there might still be data to be processed in
+%% the message queue.
+
+setopts_active(#state{transport=undefined}) ->
+	ok;
+setopts_active(#state{socket=Socket, transport=Transport, opts=Opts}) ->
+	N = maps:get(active_n, Opts, 100),
+	Transport:setopts(Socket, [{active, N}]).
+
+maybe_read_body(#state{socket=Stream={Pid, _}, transport=undefined, active=true}) ->
 	%% @todo Keep Ref around.
 	ReadBodyRef = make_ref(),
-	Pid ! {Stream, {read_body, ReadBodyRef, auto, infinity}},
-	loop(State, HandlerState, ParseState);
-before_loop(State=#state{socket=Socket, transport=Transport, hibernate=true},
-		HandlerState, ParseState) ->
-	Transport:setopts(Socket, [{active, once}]),
+	Pid ! {Stream, {read_body, self(), ReadBodyRef, auto, infinity}},
+	ok;
+maybe_read_body(_) ->
+	ok.
+
+active(State) ->
+	setopts_active(State),
+	maybe_read_body(State),
+	State#state{active=true}.
+
+passive(State=#state{transport=undefined}) ->
+	%% Unfortunately we cannot currently cancel read_body.
+	%% But that's OK, we will just stop reading the body
+	%% after the next message.
+	State#state{active=false};
+passive(State=#state{socket=Socket, transport=Transport, messages=Messages}) ->
+	Transport:setopts(Socket, [{active, false}]),
+	flush_passive(Socket, Messages),
+	State#state{active=false}.
+
+flush_passive(Socket, Messages) ->
+	receive
+		{Passive, Socket} when Passive =:= element(4, Messages);
+				%% Hardcoded for compatibility with Ranch 1.x.
+				Passive =:= tcp_passive; Passive =:= ssl_passive ->
+			flush_passive(Socket, Messages)
+	after 0 ->
+		ok
+	end.
+
+before_loop(State=#state{hibernate=true}, HandlerState, ParseState) ->
 	proc_lib:hibernate(?MODULE, loop,
 		[State#state{hibernate=false}, HandlerState, ParseState]);
-before_loop(State=#state{socket=Socket, transport=Transport},
-		HandlerState, ParseState) ->
-	Transport:setopts(Socket, [{active, once}]),
+before_loop(State, HandlerState, ParseState) ->
 	loop(State, HandlerState, ParseState).
 
 -spec loop_timeout(#state{}) -> #state{}.
-loop_timeout(State=#state{timeout=infinity}) ->
-	State#state{timeout_ref=undefined};
-loop_timeout(State=#state{timeout=Timeout, timeout_ref=PrevRef}) ->
-	_ = case PrevRef of undefined -> ignore; PrevRef ->
-		erlang:cancel_timer(PrevRef) end,
-	TRef = erlang:start_timer(Timeout, self(), ?MODULE),
-	State#state{timeout_ref=TRef}.
+loop_timeout(State=#state{opts=Opts, timeout_ref=PrevRef}) ->
+	_ = case PrevRef of
+		undefined -> ignore;
+		PrevRef -> erlang:cancel_timer(PrevRef)
+	end,
+	case maps:get(idle_timeout, Opts, 60000) of
+		infinity ->
+			State#state{timeout_ref=undefined};
+		Timeout ->
+			TRef = erlang:start_timer(Timeout, self(), ?MODULE),
+			State#state{timeout_ref=TRef}
+	end.
 
 -spec loop(#state{}, any(), parse_state()) -> no_return().
 loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
@@ -337,22 +395,28 @@ loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
 			terminate(State, HandlerState, {error, closed});
 		{Error, Socket, Reason} when Error =:= element(3, Messages) ->
 			terminate(State, HandlerState, {error, Reason});
+		{Passive, Socket} when Passive =:= element(4, Messages);
+				%% Hardcoded for compatibility with Ranch 1.x.
+				Passive =:= tcp_passive; Passive =:= ssl_passive ->
+			setopts_active(State),
+			loop(State, HandlerState, ParseState);
 		%% Body reading messages. (HTTP/2)
 		{request_body, _Ref, nofin, Data} ->
+			maybe_read_body(State),
 			State2 = loop_timeout(State),
 			parse(State2, HandlerState, ParseState, Data);
 		%% @todo We need to handle this case as if it was an {error, closed}
 		%% but not before we finish processing frames. We probably should have
 		%% a check in before_loop to let us stop looping if a flag is set.
 		{request_body, _Ref, fin, _, Data} ->
+			maybe_read_body(State),
 			State2 = loop_timeout(State),
 			parse(State2, HandlerState, ParseState, Data);
 		%% Timeouts.
 		{timeout, TRef, ?MODULE} ->
 			websocket_close(State, HandlerState, timeout);
 		{timeout, OlderTRef, ?MODULE} when is_reference(OlderTRef) ->
-			%% @todo This should call before_loop.
-			loop(State, HandlerState, ParseState);
+			before_loop(State, HandlerState, ParseState);
 		%% System messages.
 		{'EXIT', Parent, Reason} ->
 			%% @todo We should exit gracefully.
@@ -363,8 +427,7 @@ loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
 		%% Calls from supervisor module.
 		{'$gen_call', From, Call} ->
 			cowboy_children:handle_supervisor_call(Call, From, [], ?MODULE),
-			%% @todo This should call before_loop.
-			loop(State, HandlerState, ParseState);
+			before_loop(State, HandlerState, ParseState);
 		Message ->
 			handler_call(State, HandlerState, ParseState,
 				websocket_info, Message, fun before_loop/3)
@@ -377,9 +440,9 @@ parse(State, HandlerState, PS=#ps_payload{buffer=Buffer}, Data) ->
 	parse_payload(State, HandlerState, PS#ps_payload{buffer= <<>>},
 		<<Buffer/binary, Data/binary>>).
 
-parse_header(State=#state{max_frame_size=MaxFrameSize,
-		frag_state=FragState, extensions=Extensions},
+parse_header(State=#state{opts=Opts, frag_state=FragState, extensions=Extensions},
 		HandlerState, ParseState=#ps_header{buffer=Data}) ->
+	MaxFrameSize = maps:get(max_frame_size, Opts, infinity),
 	case cow_ws:parse_header(Data, Extensions, FragState) of
 		%% All frames sent from the client to the server are masked.
 		{_, _, _, _, undefined, _} ->
@@ -423,10 +486,9 @@ parse_payload(State=#state{frag_state=FragState, utf8_state=Incomplete, extensio
 			websocket_close(State, HandlerState, Error)
 	end.
 
-dispatch_frame(State=#state{max_frame_size=MaxFrameSize, frag_state=FragState,
-		frag_buffer=SoFar, extensions=Extensions}, HandlerState,
-		#ps_payload{type=Type0, unmasked=Payload0, close_code=CloseCode0},
-		RemainingData) ->
+dispatch_frame(State=#state{opts=Opts, frag_state=FragState, frag_buffer=SoFar}, HandlerState,
+		#ps_payload{type=Type0, unmasked=Payload0, close_code=CloseCode0}, RemainingData) ->
+	MaxFrameSize = maps:get(max_frame_size, Opts, infinity),
 	case cow_ws:make_frame(Type0, Payload0, CloseCode0, FragState) of
 		%% @todo Allow receiving fragments.
 		{fragment, _, _, Payload} when byte_size(Payload) + byte_size(SoFar) > MaxFrameSize ->
@@ -444,12 +506,12 @@ dispatch_frame(State=#state{max_frame_size=MaxFrameSize, frag_state=FragState,
 		{close, CloseCode, Payload} ->
 			websocket_close(State, HandlerState, {remote, CloseCode, Payload});
 		Frame = ping ->
-			transport_send(State, nofin, cow_ws:frame(pong, Extensions)),
+			transport_send(State, nofin, frame(pong, State)),
 			handler_call(State, HandlerState,
 				#ps_header{buffer=RemainingData},
 				websocket_handle, Frame, fun parse_header/3);
 		Frame = {ping, Payload} ->
-			transport_send(State, nofin, cow_ws:frame({pong, Payload}, Extensions)),
+			transport_send(State, nofin, frame({pong, Payload}, State)),
 			handler_call(State, HandlerState,
 				#ps_header{buffer=RemainingData},
 				websocket_handle, Frame, fun parse_header/3);
@@ -497,10 +559,10 @@ handler_call(State=#state{handler=Handler}, HandlerState,
 			end;
 		{stop, HandlerState2} ->
 			websocket_close(State, HandlerState2, stop)
-	catch Class:Reason ->
+	catch Class:Reason:Stacktrace ->
 		websocket_send_close(State, {crash, Class, Reason}),
 		handler_terminate(State, HandlerState, {crash, Class, Reason}),
-		erlang:raise(Class, Reason, erlang:get_stacktrace())
+		erlang:raise(Class, Reason, Stacktrace)
 	end.
 
 -spec handler_call_result(#state{}, any(), parse_state(), fun(), commands()) -> no_return().
@@ -519,10 +581,30 @@ commands([], State, []) ->
 commands([], State, Data) ->
 	Result = transport_send(State, nofin, lists:reverse(Data)),
 	{Result, State};
-commands([{active, Active}|Tail], State, Data) when is_boolean(Active) ->
+commands([{active, Active}|Tail], State0=#state{active=Active0}, Data) when is_boolean(Active) ->
+	State = if
+		Active, not Active0 ->
+			active(State0);
+		Active0, not Active ->
+			passive(State0);
+		true ->
+			State0
+	end,
 	commands(Tail, State#state{active=Active}, Data);
-commands([Frame|Tail], State=#state{extensions=Extensions}, Data0) ->
-	Data = [cow_ws:frame(Frame, Extensions)|Data0],
+commands([{deflate, Deflate}|Tail], State, Data) when is_boolean(Deflate) ->
+	commands(Tail, State#state{deflate=Deflate}, Data);
+commands([{set_options, SetOpts}|Tail], State0=#state{opts=Opts}, Data) ->
+	State = case SetOpts of
+		#{idle_timeout := IdleTimeout} ->
+			loop_timeout(State0#state{opts=Opts#{idle_timeout => IdleTimeout}});
+		_ ->
+			State0
+	end,
+	commands(Tail, State, Data);
+commands([{shutdown_reason, ShutdownReason}|Tail], State, Data) ->
+	commands(Tail, State#state{shutdown_reason=ShutdownReason}, Data);
+commands([Frame|Tail], State, Data0) ->
+	Data = [frame(Frame, State)|Data0],
 	case is_close_frame(Frame) of
 		true ->
 			_ = transport_send(State, fin, lists:reverse(Data)),
@@ -540,8 +622,8 @@ transport_send(#state{socket=Socket, transport=Transport}, _, Data) ->
 -spec websocket_send(cow_ws:frame(), #state{}) -> ok | stop | {error, atom()}.
 websocket_send(Frames, State) when is_list(Frames) ->
 	websocket_send_many(Frames, State, []);
-websocket_send(Frame, State=#state{extensions=Extensions}) ->
-	Data = cow_ws:frame(Frame, Extensions),
+websocket_send(Frame, State) ->
+	Data = frame(Frame, State),
 	case is_close_frame(Frame) of
 		true ->
 			_ = transport_send(State, fin, Data),
@@ -552,8 +634,8 @@ websocket_send(Frame, State=#state{extensions=Extensions}) ->
 
 websocket_send_many([], State, Acc) ->
 	transport_send(State, nofin, lists:reverse(Acc));
-websocket_send_many([Frame|Tail], State=#state{extensions=Extensions}, Acc0) ->
-	Acc = [cow_ws:frame(Frame, Extensions)|Acc0],
+websocket_send_many([Frame|Tail], State, Acc0) ->
+	Acc = [frame(Frame, State)|Acc0],
 	case is_close_frame(Frame) of
 		true ->
 			_ = transport_send(State, fin, lists:reverse(Acc)),
@@ -572,29 +654,38 @@ websocket_close(State, HandlerState, Reason) ->
 	websocket_send_close(State, Reason),
 	terminate(State, HandlerState, Reason).
 
-websocket_send_close(State=#state{extensions=Extensions}, Reason) ->
+websocket_send_close(State, Reason) ->
 	_ = case Reason of
 		Normal when Normal =:= stop; Normal =:= timeout ->
-			transport_send(State, fin, cow_ws:frame({close, 1000, <<>>}, Extensions));
+			transport_send(State, fin, frame({close, 1000, <<>>}, State));
 		{error, badframe} ->
-			transport_send(State, fin, cow_ws:frame({close, 1002, <<>>}, Extensions));
+			transport_send(State, fin, frame({close, 1002, <<>>}, State));
 		{error, badencoding} ->
-			transport_send(State, fin, cow_ws:frame({close, 1007, <<>>}, Extensions));
+			transport_send(State, fin, frame({close, 1007, <<>>}, State));
 		{error, badsize} ->
-			transport_send(State, fin, cow_ws:frame({close, 1009, <<>>}, Extensions));
+			transport_send(State, fin, frame({close, 1009, <<>>}, State));
 		{crash, _, _} ->
-			transport_send(State, fin, cow_ws:frame({close, 1011, <<>>}, Extensions));
+			transport_send(State, fin, frame({close, 1011, <<>>}, State));
 		remote ->
-			transport_send(State, fin, cow_ws:frame(close, Extensions));
+			transport_send(State, fin, frame(close, State));
 		{remote, Code, _} ->
-			transport_send(State, fin, cow_ws:frame({close, Code, <<>>}, Extensions))
+			transport_send(State, fin, frame({close, Code, <<>>}, State))
 	end,
 	ok.
 
+%% Don't compress frames while deflate is disabled.
+frame(Frame, #state{deflate=false, extensions=Extensions}) ->
+	cow_ws:frame(Frame, Extensions#{deflate => false});
+frame(Frame, #state{extensions=Extensions}) ->
+	cow_ws:frame(Frame, Extensions).
+
 -spec terminate(#state{}, any(), terminate_reason()) -> no_return().
-terminate(State, HandlerState, Reason) ->
+terminate(State=#state{shutdown_reason=Shutdown}, HandlerState, Reason) ->
 	handler_terminate(State, HandlerState, Reason),
-	exit(normal).
+	case Shutdown of
+		normal -> exit(normal);
+		_ -> exit({shutdown, Shutdown})
+	end.
 
 handler_terminate(#state{handler=Handler, req=Req}, HandlerState, Reason) ->
 	cowboy_handler:terminate(Reason, Req, HandlerState, Handler).

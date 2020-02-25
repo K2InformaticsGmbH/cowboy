@@ -2,6 +2,10 @@
 
 -module(resp_h).
 
+%% @todo Probably should have a separate handler for errors,
+%% so that we can dialyze all the other correct calls.
+-dialyzer({nowarn_function, do/3}).
+
 -export([init/2]).
 
 init(Req, Opts) ->
@@ -26,10 +30,23 @@ do(<<"set_resp_cookie4">>, Req0, Opts) ->
 do(<<"set_resp_header">>, Req0, Opts) ->
 	Req = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req0),
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
+do(<<"set_resp_header_server">>, Req0, Opts) ->
+	Req = cowboy_req:set_resp_header(<<"server">>, <<"nginx">>, Req0),
+	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
 do(<<"set_resp_headers">>, Req0, Opts) ->
 	Req = cowboy_req:set_resp_headers(#{
 		<<"content-type">> => <<"text/plain">>,
 		<<"content-encoding">> => <<"compress">>
+	}, Req0),
+	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
+do(<<"set_resp_headers_http11">>, Req0, Opts) ->
+	Req = cowboy_req:set_resp_headers(#{
+		<<"connection">> => <<"custom-header, close">>,
+		<<"custom-header">> => <<"value">>,
+		<<"keep-alive">> => <<"timeout=5, max=1000">>,
+		<<"proxy-connection">> => <<"close">>,
+		<<"transfer-encoding">> => <<"chunked">>,
+		<<"upgrade">> => <<"HTTP/1.1">>
 	}, Req0),
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
 do(<<"resp_header_defined">>, Req0, Opts) ->
@@ -182,6 +199,9 @@ do(<<"stream_reply2">>, Req0, Opts) ->
 		<<"204">> ->
 			Req = cowboy_req:stream_reply(204, Req0),
 			{ok, Req, Opts};
+		<<"304">> ->
+			Req = cowboy_req:stream_reply(304, Req0),
+			{ok, Req, Opts};
 		Status ->
 			Req = cowboy_req:stream_reply(binary_to_integer(Status), Req0),
 			stream_body(Req),
@@ -211,9 +231,46 @@ do(<<"stream_body">>, Req0, Opts) ->
 			cowboy_req:stream_body(<<"world">>, nofin, Req),
 			cowboy_req:stream_body(<<"!">>, fin, Req),
 			{ok, Req, Opts};
+		<<"loop">> ->
+			Req = cowboy_req:stream_reply(200, Req0),
+			_ = [cowboy_req:stream_body(<<0:1000000/unit:8>>, nofin, Req)
+				|| _ <- lists:seq(1, 32)],
+			{ok, Req, Opts};
 		<<"nofin">> ->
 			Req = cowboy_req:stream_reply(200, Req0),
 			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			{ok, Req, Opts};
+		<<"sendfile">> ->
+			AppFile = code:where_is_file("cowboy.app"),
+			AppSize = filelib:file_size(AppFile),
+			Req = cowboy_req:stream_reply(200, Req0),
+			cowboy_req:stream_body(<<"Hello ">>, nofin, Req),
+			cowboy_req:stream_body({sendfile, 0, AppSize, AppFile}, nofin, Req),
+			cowboy_req:stream_body(<<" interspersed ">>, nofin, Req),
+			cowboy_req:stream_body({sendfile, 0, AppSize, AppFile}, nofin, Req),
+			cowboy_req:stream_body(<<" world!">>, fin, Req),
+			{ok, Req, Opts};
+		<<"sendfile_fin">> ->
+			AppFile = code:where_is_file("cowboy.app"),
+			AppSize = filelib:file_size(AppFile),
+			Req = cowboy_req:stream_reply(200, Req0),
+			cowboy_req:stream_body(<<"Hello! ">>, nofin, Req),
+			cowboy_req:stream_body({sendfile, 0, AppSize, AppFile}, fin, Req),
+			{ok, Req, Opts};
+		<<"spawn">> ->
+			Req = cowboy_req:stream_reply(200, Req0),
+			Parent = self(),
+			Pid = spawn(fun() ->
+				cowboy_req:stream_body(<<"Hello ">>, nofin, Req),
+				cowboy_req:stream_body(<<"world">>, nofin, Req),
+				cowboy_req:stream_body(<<"!">>, fin, Req),
+				Parent ! {self(), ok}
+			end),
+			receive
+				{Pid, ok} -> ok
+			after 5000 ->
+				error(timeout)
+			end,
 			{ok, Req, Opts};
 		_ ->
 			%% Call stream_body without initiating streaming.
@@ -304,7 +361,8 @@ do(<<"stream_trailers">>, Req0, Opts) ->
 			Req = cowboy_req:stream_reply(200, #{
 				<<"trailer">> => <<"grpc-status">>
 			}, Req0),
-			cowboy_req:stream_body(<<0:800000>>, nofin, Req),
+			%% The size should be larger than StreamSize and ConnSize
+			cowboy_req:stream_body(<<0:80000000>>, nofin, Req),
 			cowboy_req:stream_trailers(#{
 				<<"grpc-status">> => <<"0">>
 			}, Req),
@@ -321,6 +379,8 @@ do(<<"stream_trailers">>, Req0, Opts) ->
 	end;
 do(<<"push">>, Req, Opts) ->
 	case cowboy_req:binding(arg, Req) of
+		<<"read_body">> ->
+			cowboy_req:push("/echo/read_body", #{}, Req, #{});
 		<<"method">> ->
 			cowboy_req:push("/static/style.css", #{<<"accept">> => <<"text/css">>}, Req,
 				#{method => <<"HEAD">>});

@@ -21,7 +21,7 @@ protocol.
 Extra care must be taken when implementing stream handlers
 to ensure compatibility. While some modification of the
 events and commands is allowed, it is generally not a good
-idea to completely omit them.
+idea to completely discard them.
 
 == Callbacks
 
@@ -112,6 +112,10 @@ Send a response to the client.
 
 No more data can be sent after this command.
 
+Note that in Cowboy it is the `cowboy_req` module that
+sets the date and server headers. When using the command
+directly those headers will not be added.
+
 [[headers_command]]
 === headers
 
@@ -126,6 +130,10 @@ This initiates a response to the client. The stream
 will end when a data command with the `fin` flag or
 a trailer command is returned.
 
+Note that in Cowboy it is the `cowboy_req` module that
+sets the date and server headers. When using the command
+directly those headers will not be added.
+
 [[data_command]]
 === data
 
@@ -133,7 +141,7 @@ Send data to the client.
 
 [source,erlang]
 ----
-{data, fin(), iodata()}
+{data, fin(), cowboy_req:resp_body()}
 ----
 
 [[trailers_command]]
@@ -245,85 +253,57 @@ because of an internal error. An `error_response` command
 may be sent before that to advertise to the client why the
 stream is dropped.
 
+=== log
+
+Log a message.
+
+[source,erlang]
+----
+{log, logger:level(), io:format(), list()}
+----
+
+This command can be used to log a message using the
+configured `logger` module.
+
+=== set_options
+
+Set protocol options.
+
+[source,erlang]
+----
+{set_options, map()}
+----
+
+This can also be used to override stream handler
+options. For example this is supported by
+link:man:cowboy_compress_h(3)[cowboy_compress_h(3)].
+
+Not all options can be overriden. Please consult the
+relevant option's documentation for details.
+
 == Predefined events
 
 Cowboy will forward all messages sent to the stream to
 the `info/3` callback. To send a message to a stream,
-send a message to the connection process with the form
-`{{Pid, StreamID}, Msg}`. The connection process will
-then forward `Msg` to the stream handlers.
+the function link:man:cowboy_req:cast(3)[cowboy_req:cast(3)]
+can be used.
 
 Cowboy will also forward the exit signals for the
 processes that the stream spawned.
 
-=== EXIT
+When Cowboy needs to send a response it will trigger
+an event that looks exactly like the corresponding
+command. This event must be returned to be processed
+by Cowboy (which is done automatically when using
+link:man:cowboy_stream_h(3)[cowboy_stream_h(3)]).
 
-//info(_StreamID, {'EXIT', Pid, normal}, State=#state{pid=Pid}) ->
-//info(_StreamID, {'EXIT', Pid, {_Reason, [_, {cow_http_hd, _, _, _}|_]}}, State=#state{pid=Pid}) ->
-//info(StreamID, Exit = {'EXIT', Pid, {Reason, Stacktrace}}, State=#state{ref=Ref, pid=Pid}) ->
-
-A process spawned by this stream has exited.
-
-[source,erlang]
-----
-{'EXIT', pid(), any()}
-----
-
-This is the raw exit message without any modification.
-
-// === read_body
-// 
-// //info(_StreamID, {read_body, Ref, Length, _},
-// //info(StreamID, {read_body, Ref, Length, Period}, State) ->
-// 
-// TODO yeah I am not actually sure this one should be public just yet
-
-=== inform
-
-Same as the xref:inform_command[inform command].
-
-Sent when the request process reads the body and an
-expect: 100-continue header was present in the request,
-or when the request process sends an informational
-response on its own.
-
-=== response
-
-Same as the xref:response_command[response command].
-
-Usually sent when the request process replies to the client.
-May also be sent by Cowboy internally.
-
-=== headers
-
-Same as the xref:headers_command[headers command].
-
-Sent when the request process starts replying to the client.
-
-=== data
-
-Same as the xref:data_command[data command].
-
-Sent when the request process streams data to the client.
-
-=== trailers
-
-Same as the xref:trailers_command[trailers command].
-
-Sent when the request process sends the trailer field values
-to the client.
-
-=== push
-
-Same as the xref:push_command[push command].
-
-Sent when the request process pushes a resource to the client.
-
-=== switch_protocol
-
-Same as the xref:switch_protocol_command[switch_protocol command].
-
-Sent when switching to the HTTP/2 or Websocket protocol.
+Cowboy may trigger the following events on its own,
+regardless of the stream handlers configured:
+xref:inform_command[inform] (to send a 101
+informational response when upgrading to HTTP/2 or
+Websocket), xref:response_command[response],
+xref:headers_command[headers], xref:data_command[data]
+and xref:switch_protocol_command[switch_protocol].
 
 == Exports
 
@@ -386,7 +366,7 @@ reason() :: normal | switch_protocol
     | {socket_error, closed | atom(), HumanReadable}
     | {stream_error, Error, HumanReadable}
     | {connection_error, Error, HumanReadable}
-    | {stop, cow_http2:frame(), HumanReadable}
+    | {stop, cow_http2:frame() | {exit, any()}, HumanReadable}
 
 Error         = atom()
 HumanReadable = atom()
@@ -420,11 +400,15 @@ tuple.
 
 == Changelog
 
-* *2.2*: The trailers command was introduced.
+* *2.7*: The `log` and `set_options` commands were introduced.
+* *2.6*: The `data` command can now contain a sendfile tuple.
+* *2.6*: The `{stop, {exit, any()}, HumanReadable}` terminate reason was added.
+* *2.2*: The `trailers` command was introduced.
 * *2.0*: Module introduced.
 
 == See also
 
 link:man:cowboy(7)[cowboy(7)],
 link:man:cowboy_http(3)[cowboy_http(3)],
-link:man:cowboy_http2(3)[cowboy_http2(3)]
+link:man:cowboy_http2(3)[cowboy_http2(3)],
+link:man:cowboy_req:cast(3)[cowboy_req:cast(3)]

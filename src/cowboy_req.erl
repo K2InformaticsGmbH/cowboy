@@ -15,10 +15,6 @@
 
 -module(cowboy_req).
 
--ifdef(OTP_RELEASE).
--compile({nowarn_deprecated_function, [{erlang, get_stacktrace, 0}]}).
--endif.
-
 %% Request.
 -export([method/1]).
 -export([version/1]).
@@ -44,6 +40,7 @@
 -export([headers/1]).
 -export([parse_header/2]).
 -export([parse_header/3]).
+-export([filter_cookies/2]).
 -export([parse_cookies/1]).
 -export([match_cookies/2]).
 
@@ -91,12 +88,11 @@
 -export([push/3]).
 -export([push/4]).
 
+%% Stream handlers.
+-export([cast/2]).
+
 %% Internal.
 -export([response_headers/2]).
-
-%% @todo Get rid of this type, use cow_cookie directly.
--type cookie_opts() :: map().
--export_type([cookie_opts/0]).
 
 -type read_body_opts() :: #{
 	length => non_neg_integer() | infinity,
@@ -107,7 +103,6 @@
 
 %% While sendfile allows a Len of 0 that means "everything past Offset",
 %% Cowboy expects the real length as it is used as metadata.
-%% @todo We should probably explicitly reject it.
 -type resp_body() :: iodata()
 	| {sendfile, non_neg_integer(), non_neg_integer(), file:name_all()}.
 -export_type([resp_body/0]).
@@ -121,31 +116,51 @@
 }.
 -export_type([push_opts/0]).
 
--type req() :: map(). %% @todo #{
-%	ref := ranch:ref(),
-%	pid := pid(),
-%	streamid := cowboy_stream:streamid(),
-%	peer := {inet:ip_address(), inet:port_number()},
-%
-%	method := binary(), %% case sensitive
-%	version := cowboy:http_version() | atom(),
-%	scheme := binary(), %% <<"http">> or <<"https">>
-%	host := binary(), %% lowercase; case insensitive
-%	port := inet:port_number(),
-%	path := binary(), %% case sensitive
-%	qs := binary(), %% case sensitive
-%	headers := cowboy:http_headers(),
-%
-%	host_info => cowboy_router:tokens(),
-%	path_info => cowboy_router:tokens(),
-%	bindings => cowboy_router:bindings(),
-%
-%	has_body := boolean(),
-%	has_read_body => true,
-%	body_length := undefined | non_neg_integer()
-%
-%% @todo resp_*
-%}.
+-type req() :: #{
+	%% Public interface.
+	method := binary(),
+	version := cowboy:http_version() | atom(),
+	scheme := binary(),
+	host := binary(),
+	port := inet:port_number(),
+	path := binary(),
+	qs := binary(),
+	headers := cowboy:http_headers(),
+	peer := {inet:ip_address(), inet:port_number()},
+	sock := {inet:ip_address(), inet:port_number()},
+	cert := binary() | undefined,
+
+	%% Private interface.
+	ref := ranch:ref(),
+	pid := pid(),
+	streamid := cowboy_stream:streamid(),
+
+	host_info => cowboy_router:tokens(),
+	path_info => cowboy_router:tokens(),
+	bindings => cowboy_router:bindings(),
+
+	has_body := boolean(),
+	body_length := non_neg_integer() | undefined,
+	has_read_body => true,
+	multipart => {binary(), binary()} | done,
+
+	has_sent_resp => headers | true,
+	resp_cookies => #{iodata() => iodata()},
+	resp_headers => #{binary() => iodata()},
+	resp_body => resp_body(),
+
+	proxy_header => ranch_proxy_header:proxy_info(),
+	media_type => {binary(), binary(), [{binary(), binary()}]},
+	language => binary() | undefined,
+	charset => binary() | undefined,
+	range => {binary(), binary()
+		| [{non_neg_integer(), non_neg_integer() | infinity} | neg_integer()]},
+	websocket_version => 7 | 8 | 13,
+
+	%% The user is encouraged to use the Req to store information
+	%% when no better solution is available.
+	_ => _
+}.
 -export_type([req/0]).
 
 %% Request.
@@ -205,10 +220,10 @@ qs(#{qs := Qs}) ->
 parse_qs(#{qs := Qs}) ->
 	try
 		cow_qs:parse_qs(Qs)
-	catch _:_ ->
+	catch _:_:Stacktrace ->
 		erlang:raise(exit, {request_error, qs,
 			'Malformed query string; application/x-www-form-urlencoded expected.'
-		}, erlang:get_stacktrace())
+		}, Stacktrace)
 	end.
 
 -spec match_qs(cowboy:fields(), req()) -> map().
@@ -396,10 +411,10 @@ parse_header(Name, Req) ->
 parse_header(Name, Req, Default) ->
 	try
 		parse_header(Name, Req, Default, parse_header_fun(Name))
-	catch _:_ ->
+	catch _:_:Stacktrace ->
 		erlang:raise(exit, {request_error, {header, Name},
 			'Malformed header. Please consult the relevant specification.'
-		}, erlang:get_stacktrace())
+		}, Stacktrace)
 	end.
 
 parse_header_fun(<<"accept">>) -> fun cow_http_hd:parse_accept/1;
@@ -415,6 +430,7 @@ parse_header_fun(<<"expect">>) -> fun cow_http_hd:parse_expect/1;
 parse_header_fun(<<"if-match">>) -> fun cow_http_hd:parse_if_match/1;
 parse_header_fun(<<"if-modified-since">>) -> fun cow_http_hd:parse_if_modified_since/1;
 parse_header_fun(<<"if-none-match">>) -> fun cow_http_hd:parse_if_none_match/1;
+parse_header_fun(<<"if-range">>) -> fun cow_http_hd:parse_if_range/1;
 parse_header_fun(<<"if-unmodified-since">>) -> fun cow_http_hd:parse_if_unmodified_since/1;
 parse_header_fun(<<"range">>) -> fun cow_http_hd:parse_range/1;
 parse_header_fun(<<"sec-websocket-extensions">>) -> fun cow_http_hd:parse_sec_websocket_extensions/1;
@@ -428,6 +444,35 @@ parse_header(Name, Req, Default, ParseFun) ->
 		undefined -> Default;
 		Value -> ParseFun(Value)
 	end.
+
+-spec filter_cookies([atom() | binary()], Req) -> Req when Req::req().
+filter_cookies(Names0, Req=#{headers := Headers}) ->
+	Names = [if
+		is_atom(N) -> atom_to_binary(N, utf8);
+		true -> N
+	end || N <- Names0],
+	case header(<<"cookie">>, Req) of
+		undefined -> Req;
+		Value0 ->
+			Cookies0 = binary:split(Value0, <<$;>>),
+			Cookies = lists:filter(fun(Cookie) ->
+				lists:member(cookie_name(Cookie), Names)
+			end, Cookies0),
+			Value = iolist_to_binary(lists:join($;, Cookies)),
+			Req#{headers => Headers#{<<"cookie">> => Value}}
+	end.
+
+%% This is a specialized function to extract a cookie name
+%% regardless of whether the name is valid or not. We skip
+%% whitespace at the beginning and take whatever's left to
+%% be the cookie name, up to the = sign.
+cookie_name(<<$\s, Rest/binary>>) -> cookie_name(Rest);
+cookie_name(<<$\t, Rest/binary>>) -> cookie_name(Rest);
+cookie_name(Name) -> cookie_name(Name, <<>>).
+
+cookie_name(<<>>, Name) -> Name;
+cookie_name(<<$=, _/bits>>, Name) -> Name;
+cookie_name(<<C, Rest/bits>>, Acc) -> cookie_name(Rest, <<Acc/binary, C>>).
 
 -spec parse_cookies(req()) -> [{binary(), binary()}].
 parse_cookies(Req) ->
@@ -465,12 +510,12 @@ read_body(Req=#{has_body := false}, _) ->
 	{ok, <<>>, Req};
 read_body(Req=#{has_read_body := true}, _) ->
 	{ok, <<>>, Req};
-read_body(Req=#{pid := Pid, streamid := StreamID}, Opts) ->
+read_body(Req, Opts) ->
 	Length = maps:get(length, Opts, 8000000),
 	Period = maps:get(period, Opts, 15000),
 	Timeout = maps:get(timeout, Opts, Period + 1000),
 	Ref = make_ref(),
-	Pid ! {{Pid, StreamID}, {read_body, Ref, Length, Period}},
+	cast({read_body, self(), Ref, Length, Period}, Req),
 	receive
 		{request_body, Ref, nofin, Body} ->
 			{more, Body, Req};
@@ -497,10 +542,10 @@ read_urlencoded_body(Req0, Opts) ->
 		{ok, Body, Req} ->
 			try
 				{ok, cow_qs:parse_qs(Body), Req}
-			catch _:_ ->
+			catch _:_:Stacktrace ->
 				erlang:raise(exit, {request_error, urlencoded_body,
 					'Malformed body; application/x-www-form-urlencoded expected.'
-				}, erlang:get_stacktrace())
+				}, Stacktrace)
 			end;
 		{more, Body, _} ->
 			Length = maps:get(length, Opts, 64000),
@@ -534,13 +579,13 @@ read_and_match_urlencoded_body(Fields, Req0, Opts) ->
 %% Multipart.
 
 -spec read_part(Req)
-	-> {ok, cow_multipart:headers(), Req} | {done, Req}
+	-> {ok, cowboy:http_headers(), Req} | {done, Req}
 	when Req::req().
 read_part(Req) ->
 	read_part(Req, #{length => 64000, period => 5000}).
 
 -spec read_part(Req, read_body_opts())
-	-> {ok, #{binary() => binary()}, Req} | {done, Req}
+	-> {ok, cowboy:http_headers(), Req} | {done, Req}
 	when Req::req().
 read_part(Req, Opts) ->
 	case maps:is_key(multipart, Req) of
@@ -567,10 +612,10 @@ read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
 		%% Ignore epilogue.
 		{done, _} ->
 			{done, Req#{multipart => done}}
-	catch _:_ ->
+	catch _:_:Stacktrace ->
 		erlang:raise(exit, {request_error, {multipart, headers},
 			'Malformed body; multipart expected.'
-		}, erlang:get_stacktrace())
+		}, Stacktrace)
 	end.
 
 -spec read_part_body(Req)
@@ -650,11 +695,10 @@ set_resp_cookie(Name, Value, Req) ->
 %%
 %% The cookie value cannot contain any of the following characters:
 %%   ,; \t\r\n\013\014
-%% @todo Fix the cookie_opts() type.
--spec set_resp_cookie(binary(), iodata(), Req, cookie_opts())
+-spec set_resp_cookie(binary(), iodata(), Req, cow_cookie:cookie_opts())
 	-> Req when Req::req().
 set_resp_cookie(Name, Value, Req, Opts) ->
-	Cookie = cow_cookie:setcookie(Name, Value, maps:to_list(Opts)),
+	Cookie = cow_cookie:setcookie(Name, Value, Opts),
 	RespCookies = maps:get(resp_cookies, Req, #{}),
 	Req#{resp_cookies => RespCookies#{Name => Cookie}}.
 
@@ -724,10 +768,8 @@ inform(Status, Req) ->
 -spec inform(cowboy:http_status(), cowboy:http_headers(), req()) -> ok.
 inform(_, _, #{has_sent_resp := _}) ->
 	error(function_clause); %% @todo Better error message.
-inform(Status, Headers, #{pid := Pid, streamid := StreamID})
-		when is_integer(Status); is_binary(Status) ->
-	Pid ! {{Pid, StreamID}, {inform, Status, Headers}},
-	ok.
+inform(Status, Headers, Req) when is_integer(Status); is_binary(Status) ->
+	cast({inform, Status, Headers}, Req).
 
 -spec reply(cowboy:http_status(), Req) -> Req when Req::req().
 reply(Status, Req) ->
@@ -754,10 +796,14 @@ reply(Status, Headers, SendFile = {sendfile, _, Len, _}, Req)
 	do_reply(Status, Headers#{
 		<<"content-length">> => integer_to_binary(Len)
 	}, SendFile, Req);
-%% 204 responses must not include content-length. (RFC7230 3.3.1, RFC7230 3.3.2)
-reply(Status=204, Headers, Body, Req) ->
+%% 204 responses must not include content-length. 304 responses may
+%% but only when set explicitly. (RFC7230 3.3.1, RFC7230 3.3.2)
+reply(Status, Headers, Body, Req)
+		when Status =:= 204; Status =:= 304 ->
 	do_reply(Status, Headers, Body, Req);
 reply(Status= <<"204",_/bits>>, Headers, Body, Req) ->
+	do_reply(Status, Headers, Body, Req);
+reply(Status= <<"304",_/bits>>, Headers, Body, Req) ->
 	do_reply(Status, Headers, Body, Req);
 reply(Status, Headers, Body, Req)
 		when is_integer(Status); is_binary(Status) ->
@@ -768,11 +814,11 @@ reply(Status, Headers, Body, Req)
 %% Don't send any body for HEAD responses. While the protocol code is
 %% supposed to enforce this rule, we prefer to avoid copying too much
 %% data around if we can avoid it.
-do_reply(Status, Headers, _, Req=#{pid := Pid, streamid := StreamID, method := <<"HEAD">>}) ->
-	Pid ! {{Pid, StreamID}, {response, Status, response_headers(Headers, Req), <<>>}},
+do_reply(Status, Headers, _, Req=#{method := <<"HEAD">>}) ->
+	cast({response, Status, response_headers(Headers, Req), <<>>}, Req),
 	done_replying(Req, true);
-do_reply(Status, Headers, Body, Req=#{pid := Pid, streamid := StreamID}) ->
-	Pid ! {{Pid, StreamID}, {response, Status, response_headers(Headers, Req), Body}},
+do_reply(Status, Headers, Body, Req) ->
+	cast({response, Status, response_headers(Headers, Req), Body}, Req),
 	done_replying(Req, true).
 
 done_replying(Req, HasSentResp) ->
@@ -786,42 +832,51 @@ stream_reply(Status, Req) ->
 	-> Req when Req::req().
 stream_reply(_, _, #{has_sent_resp := _}) ->
 	error(function_clause);
-stream_reply(Status, Headers=#{}, Req=#{pid := Pid, streamid := StreamID})
-		when is_integer(Status); is_binary(Status) ->
-	Pid ! {{Pid, StreamID}, {headers, Status, response_headers(Headers, Req)}},
+stream_reply(Status, Headers=#{}, Req) when is_integer(Status); is_binary(Status) ->
+	cast({headers, Status, response_headers(Headers, Req)}, Req),
 	done_replying(Req, headers).
 
--spec stream_body(iodata(), fin | nofin, req()) -> ok.
+-spec stream_body(resp_body(), fin | nofin, req()) -> ok.
 %% Error out if headers were not sent.
 %% Don't send any body for HEAD responses.
 stream_body(_, _, #{method := <<"HEAD">>, has_sent_resp := headers}) ->
 	ok;
 %% Don't send a message if the data is empty, except for the
-%% very last message with IsFin=fin.
-stream_body(Data, IsFin=nofin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
+%% very last message with IsFin=fin. When using sendfile this
+%% is converted to a data tuple, however.
+stream_body({sendfile, _, 0, _}, nofin, _) ->
+	ok;
+stream_body({sendfile, _, 0, _}, IsFin=fin, Req=#{has_sent_resp := headers}) ->
+	stream_body({data, self(), IsFin, <<>>}, Req);
+stream_body({sendfile, O, B, P}, IsFin, Req=#{has_sent_resp := headers})
+		when is_integer(O), O >= 0, is_integer(B), B > 0 ->
+	stream_body({data, self(), IsFin, {sendfile, O, B, P}}, Req);
+stream_body(Data, IsFin=nofin, Req=#{has_sent_resp := headers})
+		when not is_tuple(Data) ->
 	case iolist_size(Data) of
 		0 -> ok;
-		_ ->
-			Pid ! {{Pid, StreamID}, {data, IsFin, Data}},
-			ok
+		_ -> stream_body({data, self(), IsFin, Data}, Req)
 	end;
-stream_body(Data, IsFin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
-	Pid ! {{Pid, StreamID}, {data, IsFin, Data}},
-	ok.
+stream_body(Data, IsFin, Req=#{has_sent_resp := headers})
+		when not is_tuple(Data) ->
+	stream_body({data, self(), IsFin, Data}, Req).
+
+%% @todo Do we need a timeout?
+stream_body(Msg, Req=#{pid := Pid}) ->
+	cast(Msg, Req),
+	receive {data_ack, Pid} -> ok end.
 
 -spec stream_events(cow_sse:event() | [cow_sse:event()], fin | nofin, req()) -> ok.
 stream_events(Event, IsFin, Req) when is_map(Event) ->
 	stream_events([Event], IsFin, Req);
-stream_events(Events, IsFin, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
-	Pid ! {{Pid, StreamID}, {data, IsFin, cow_sse:events(Events)}},
-	ok.
+stream_events(Events, IsFin, Req=#{has_sent_resp := headers}) ->
+	stream_body({data, self(), IsFin, cow_sse:events(Events)}, Req).
 
 -spec stream_trailers(cowboy:http_headers(), req()) -> ok.
-stream_trailers(Trailers, #{pid := Pid, streamid := StreamID, has_sent_resp := headers}) ->
-	Pid ! {{Pid, StreamID}, {trailers, Trailers}},
-	ok.
+stream_trailers(Trailers, Req=#{has_sent_resp := headers}) ->
+	cast({trailers, Trailers}, Req).
 
--spec push(binary(), cowboy:http_headers(), req()) -> ok.
+-spec push(iodata(), cowboy:http_headers(), req()) -> ok.
 push(Path, Headers, Req) ->
 	push(Path, Headers, Req, #{}).
 
@@ -829,14 +884,19 @@ push(Path, Headers, Req) ->
 %% @todo Path, Headers, Opts, everything should be in proper binary,
 %% or normalized when creating the Req object.
 -spec push(iodata(), cowboy:http_headers(), req(), push_opts()) -> ok.
-push(Path, Headers, #{pid := Pid, streamid := StreamID,
-		scheme := Scheme0, host := Host0, port := Port0}, Opts) ->
+push(Path, Headers, Req=#{scheme := Scheme0, host := Host0, port := Port0}, Opts) ->
 	Method = maps:get(method, Opts, <<"GET">>),
 	Scheme = maps:get(scheme, Opts, Scheme0),
 	Host = maps:get(host, Opts, Host0),
 	Port = maps:get(port, Opts, Port0),
 	Qs = maps:get(qs, Opts, <<>>),
-	Pid ! {{Pid, StreamID}, {push, Method, Scheme, Host, Port, Path, Qs, Headers}},
+	cast({push, Method, Scheme, Host, Port, Path, Qs, Headers}, Req).
+
+%% Stream handlers.
+
+-spec cast(any(), req()) -> ok.
+cast(Msg, #{pid := Pid, streamid := StreamID}) ->
+	Pid ! {{Pid, StreamID}, Msg},
 	ok.
 
 %% Internal.

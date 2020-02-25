@@ -111,13 +111,13 @@ gun_open(Config, Opts) ->
 	{ok, ConnPid} = gun:open("localhost", config(port, Config), Opts#{
 		retry => 0,
 		transport => config(type, Config),
-		transport_opts => proplists:get_value(transport_opts, Config, []),
+		tls_opts => proplists:get_value(tls_opts, Config, []),
 		protocols => [config(protocol, Config)]
 	}),
 	ConnPid.
 
 gun_down(ConnPid) ->
-	receive {gun_down, ConnPid, _, _, _, _} -> ok
+	receive {gun_down, ConnPid, _, _, _} -> ok
 	after 500 -> error(timeout) end.
 
 %% Support functions for testing using a raw socket.
@@ -152,6 +152,8 @@ raw_recv_head(Socket, Transport, Buffer) ->
 raw_recv({raw_client, Socket, Transport}, Length, Timeout) ->
 	Transport:recv(Socket, Length, Timeout).
 
+raw_expect_recv({raw_client, _, _}, <<>>) ->
+	ok;
 raw_expect_recv({raw_client, Socket, Transport}, Expect) ->
 	{ok, Expect} = Transport:recv(Socket, iolist_size(Expect), 10000),
 	ok.

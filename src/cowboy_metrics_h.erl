@@ -71,8 +71,7 @@
 	%% Start/end of the processing of the request.
 	%%
 	%% This represents the time from this stream handler's init
-	%% to terminate. Note that this doesn't indicate the response
-	%% has been sent fully, it still may be queued up in a buffer.
+	%% to terminate.
 	req_start => integer(),
 	req_end => integer(),
 
@@ -103,9 +102,15 @@
 	%% Length of the request and response bodies. This does
 	%% not include the framing.
 	req_body_length => non_neg_integer(),
-	resp_body_length => non_neg_integer()
+	resp_body_length => non_neg_integer(),
+
+	%% Additional metadata set by the user.
+	user_data => map()
 }.
 -export_type([metrics/0]).
+
+-type metrics_callback() :: fun((metrics()) -> any()).
+-export_type([metrics_callback/0]).
 
 -record(state, {
 	next :: any(),
@@ -124,7 +129,8 @@
 	procs = #{} :: proc_metrics(),
 	informational = [] :: [informational_metrics()],
 	req_body_length = 0 :: non_neg_integer(),
-	resp_body_length = 0 :: non_neg_integer()
+	resp_body_length = 0 :: non_neg_integer(),
+	user_data = #{} :: map()
 }).
 
 -spec init(cowboy_stream:streamid(), cowboy_req:req(), cowboy:opts())
@@ -220,6 +226,16 @@ fold([{response, Status, Headers, Body}|Tail],
 		resp_end=Resp,
 		resp_body_length=resp_body_length(Body)
 	});
+fold([{error_response, Status, Headers, Body}|Tail],
+		State=#state{resp_status=RespStatus}) ->
+	%% The error_response command only results in a response
+	%% if no response was sent before.
+	case RespStatus of
+		undefined ->
+			fold([{response, Status, Headers, Body}|Tail], State);
+		_ ->
+			fold(Tail, State)
+	end;
 fold([{headers, Status, Headers}|Tail],
 		State=#state{resp_headers_filter=RespHeadersFilter}) ->
 	RespStart = erlang:monotonic_time(),
@@ -231,6 +247,8 @@ fold([{headers, Status, Headers}|Tail],
 		end,
 		resp_start=RespStart
 	});
+%% @todo It might be worthwhile to keep the sendfile information around,
+%% especially if these frames ultimately result in a sendfile syscall.
 fold([{data, nofin, Data}|Tail], State=#state{resp_body_length=RespBodyLen}) ->
 	fold(Tail, State#state{
 		resp_body_length=RespBodyLen + resp_body_length(Data)
@@ -241,6 +259,14 @@ fold([{data, fin, Data}|Tail], State=#state{resp_body_length=RespBodyLen}) ->
 		resp_end=RespEnd,
 		resp_body_length=RespBodyLen + resp_body_length(Data)
 	});
+fold([{set_options, SetOpts}|Tail], State0=#state{user_data=OldUserData}) ->
+	State = case SetOpts of
+		#{metrics_user_data := NewUserData} ->
+			State0#state{user_data=maps:merge(OldUserData, NewUserData)};
+		_ ->
+			State0
+	end,
+	fold(Tail, State);
 fold([_|Tail], State) ->
 	fold(Tail, State).
 
@@ -249,7 +275,7 @@ terminate(StreamID, Reason, #state{next=Next, callback=Fun,
 		req=Req, resp_status=RespStatus, resp_headers=RespHeaders, ref=Ref,
 		req_start=ReqStart, req_body_start=ReqBodyStart,
 		req_body_end=ReqBodyEnd, resp_start=RespStart, resp_end=RespEnd,
-		procs=Procs, informational=Infos,
+		procs=Procs, informational=Infos, user_data=UserData,
 		req_body_length=ReqBodyLen, resp_body_length=RespBodyLen}) ->
 	Res = cowboy_stream:terminate(StreamID, Reason, Next),
 	ReqEnd = erlang:monotonic_time(),
@@ -270,7 +296,8 @@ terminate(StreamID, Reason, #state{next=Next, callback=Fun,
 		procs => Procs,
 		informational => lists:reverse(Infos),
 		req_body_length => ReqBodyLen,
-		resp_body_length => RespBodyLen
+		resp_body_length => RespBodyLen,
+		user_data => UserData
 	},
 	Fun(Metrics),
 	Res.

@@ -29,35 +29,59 @@ all() ->
 groups() ->
 	cowboy_test:common_groups(ct_helper:all(?MODULE)).
 
+%% We set this module as a logger in order to silence expected errors.
 init_per_group(Name = http, Config) ->
-	cowboy_test:init_http(Name, #{stream_handlers => [stream_handler_h]}, Config);
+	cowboy_test:init_http(Name, #{
+		logger => ?MODULE,
+		stream_handlers => [stream_handler_h]
+	}, Config);
 init_per_group(Name = https, Config) ->
-	cowboy_test:init_https(Name, #{stream_handlers => [stream_handler_h]}, Config);
+	cowboy_test:init_https(Name, #{
+		logger => ?MODULE,
+		stream_handlers => [stream_handler_h]
+	}, Config);
 init_per_group(Name = h2, Config) ->
-	cowboy_test:init_http2(Name, #{stream_handlers => [stream_handler_h]}, Config);
+	cowboy_test:init_http2(Name, #{
+		logger => ?MODULE,
+		stream_handlers => [stream_handler_h]
+	}, Config);
 init_per_group(Name = h2c, Config) ->
-	Config1 = cowboy_test:init_http(Name, #{stream_handlers => [stream_handler_h]}, Config),
+	Config1 = cowboy_test:init_http(Name, #{
+		logger => ?MODULE,
+		stream_handlers => [stream_handler_h]
+	}, Config),
 	lists:keyreplace(protocol, 1, Config1, {protocol, http2});
 init_per_group(Name = http_compress, Config) ->
 	cowboy_test:init_http(Name, #{
+		logger => ?MODULE,
 		stream_handlers => [cowboy_compress_h, stream_handler_h]
 	}, Config);
 init_per_group(Name = https_compress, Config) ->
 	cowboy_test:init_https(Name, #{
+		logger => ?MODULE,
 		stream_handlers => [cowboy_compress_h, stream_handler_h]
 	}, Config);
 init_per_group(Name = h2_compress, Config) ->
 	cowboy_test:init_http2(Name, #{
+		logger => ?MODULE,
 		stream_handlers => [cowboy_compress_h, stream_handler_h]
 	}, Config);
 init_per_group(Name = h2c_compress, Config) ->
 	Config1 = cowboy_test:init_http(Name, #{
+		logger => ?MODULE,
 		stream_handlers => [cowboy_compress_h, stream_handler_h]
 	}, Config),
 	lists:keyreplace(protocol, 1, Config1, {protocol, http2}).
 
 end_per_group(Name, _) ->
 	cowboy:stop_listener(Name).
+
+%% Logger function silencing the expected crashes.
+
+error("Unhandled exception " ++ _, [error, crash|_]) ->
+	ok;
+error(Format, Args) ->
+	error_logger:error_msg(Format, Args).
 
 %% Tests.
 
@@ -74,10 +98,16 @@ crash_in_init(Config) ->
 	Pid = receive {Self, P, init, _, _, _} -> P after 1000 -> error(timeout) end,
 	%% Confirm terminate/3 is NOT called. We have no state to give to it.
 	receive {Self, Pid, terminate, _, _, _} -> error(terminate) after 1000 -> ok end,
+	%% Confirm early_error/5 is called in HTTP/1.1's case.
+	%% HTTP/2 does not send a response back so there is no early_error call.
+	case config(protocol, Config) of
+		http -> receive {Self, Pid, early_error, _, _, _, _, _} -> ok after 1000 -> error(timeout) end;
+		http2 -> ok
+	end,
 	%% Receive a 500 error response.
 	case gun:await(ConnPid, Ref) of
 		{response, fin, 500, _} -> ok;
-		{error, {stream_error, internal_error, _}} -> ok
+		{error, {stream_error, {stream_error, internal_error, _}}} -> ok
 	end.
 
 crash_in_data(Config) ->
@@ -99,7 +129,7 @@ crash_in_data(Config) ->
 	%% Receive a 500 error response.
 	case gun:await(ConnPid, Ref) of
 		{response, fin, 500, _} -> ok;
-		{error, {stream_error, internal_error, _}} -> ok
+		{error, {stream_error, {stream_error, internal_error, _}}} -> ok
 	end.
 
 crash_in_info(Config) ->
@@ -120,7 +150,7 @@ crash_in_info(Config) ->
 	%% Receive a 500 error response.
 	case gun:await(ConnPid, Ref) of
 		{response, fin, 500, _} -> ok;
-		{error, {stream_error, internal_error, _}} -> ok
+		{error, {stream_error, {stream_error, internal_error, _}}} -> ok
 	end.
 
 crash_in_terminate(Config) ->
@@ -223,6 +253,65 @@ do_crash_in_early_error_fatal(Config) ->
 	{response, fin, 400, _} = gun:await(ConnPid, Ref),
 	%% Confirm the connection gets closed.
 	gun_down(ConnPid).
+
+early_error_stream_error_reason(Config) ->
+	doc("Confirm that the stream_error given to early_error/5 is consistent between protocols."),
+	Self = self(),
+	ConnPid = gun_open(Config),
+	%% We must use different solutions to hit early_error with a stream_error
+	%% reason in both protocols.
+	{Method, Headers, Status, Error} = case config(protocol, Config) of
+		http -> {<<"GET">>, [{<<"host">>, <<"host:port">>}], 400, protocol_error};
+		http2 -> {<<"TRACE">>, [], 501, no_error}
+	end,
+	Ref = gun:request(ConnPid, Method, "/long_polling", [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"x-test-case">>, <<"early_error_stream_error_reason">>},
+		{<<"x-test-pid">>, pid_to_list(Self)}
+	|Headers], <<>>),
+	%% Confirm init/3 is NOT called. The error occurs before we reach this step.
+	receive {Self, _, init, _, _, _} -> error(init) after 1000 -> ok end,
+	%% Confirm terminate/3 is NOT called. We have no state to give to it.
+	receive {Self, _, terminate, _, _, _} -> error(terminate) after 1000 -> ok end,
+	%% Confirm early_error/5 is called.
+	Reason = receive {Self, _, early_error, _, R, _, _, _} -> R after 1000 -> error(timeout) end,
+	%% Confirm that the Reason is a {stream_error, Reason, Human}.
+	{stream_error, Error, HumanReadable} = Reason,
+	true = is_atom(HumanReadable),
+	%% Receive a 400 or 501 error response.
+	{response, fin, Status, _} = gun:await(ConnPid, Ref),
+	ok.
+
+flow_after_body_fully_read(Config) ->
+	doc("A flow command may be returned even after the body was read fully."),
+	Self = self(),
+	ConnPid = gun_open(Config),
+	Ref = gun:post(ConnPid, "/long_polling", [
+		{<<"x-test-case">>, <<"flow_after_body_fully_read">>},
+		{<<"x-test-pid">>, pid_to_list(Self)}
+	], <<"Hello world!">>),
+	%% Receive a 200 response, sent after the second flow command,
+	%% confirming that the flow command was accepted.
+	{response, _, 200, _} = gun:await(ConnPid, Ref),
+	ok.
+
+set_options_ignore_unknown(Config) ->
+	doc("Confirm that unknown options are ignored when using the set_options commands."),
+	Self = self(),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/long_polling", [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"x-test-case">>, <<"set_options_ignore_unknown">>},
+		{<<"x-test-pid">>, pid_to_list(Self)}
+	]),
+	%% Confirm init/3 is called.
+	Pid = receive {Self, P, init, _, _, _} -> P after 1000 -> error(timeout) end,
+	%% Confirm terminate/3 is called, indicating the stream ended.
+	receive {Self, Pid, terminate, _, _, _} -> ok after 1000 -> error(timeout) end,
+	%% Confirm the response is sent.
+	{response, nofin, 200, _} = gun:await(ConnPid, Ref),
+	{ok, _} = gun:await_body(ConnPid, Ref),
+	ok.
 
 shutdown_on_stream_stop(Config) ->
 	doc("Confirm supervised processes are shutdown when stopping the stream."),
